@@ -170,7 +170,10 @@ inhomogeneous_layer_cycle_interval: 1
 # but a smaller size per microbatch which may hurt per-stage performance. Additionally, note when microbatches > num_stages we have the opportunity to
 # perform the circular transfer (last stage to first) asynchronously.
 # The bubble fraction is (num_stages - 1) / (num_pipeline_repeats * num_pipeline_microbatches + num_stages - 1)
-num_layers_per_pipeline_stage: 1
+# num_layers_per_pipeline_stage: 1
+# num_layers_per_pipeline_stage: 2
+num_layers_per_pipeline_stage: 4
+# num_layers_per_pipeline_stage: 8
 # The number of repeats will be set to num_decoder_layers / (num_pipeline_stages * num_layers_per_pipeline_stage)
 num_pipeline_repeats: -1
 pipeline_parallel_layers: -1 # Pipeline only this number of layers - for the remaining layers the "stage" mesh axes will act like data parallelism.
@@ -205,6 +208,8 @@ scan_pipeline_iterations: True
 scan_layers_per_stage: False
 set_remat_policy_on_pipeline_iterations: True
 set_remat_policy_on_layers_per_stage: False
+
+use_mmpp: False
 
 
 # Choose 'remat_policy' between 'minimal', 'save_dot_with_context_except_mlp', 'save_dot_except_mlpwi', 'save_dot_except_mlp',

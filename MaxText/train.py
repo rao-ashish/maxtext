@@ -56,6 +56,8 @@ from cloud_tpu_diagnostics.configuration import debug_configuration
 from cloud_tpu_diagnostics.configuration import diagnostic_configuration
 from cloud_tpu_diagnostics.configuration import stack_trace_configuration
 
+from MaxText import mmpp
+
 from MaxText import checkpointing
 from MaxText import max_logging
 from MaxText import max_utils
@@ -385,6 +387,7 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
     for k, v in data.items():
       data[k] = v[: config.micro_batch_size_to_eval_on, :]
 
+  rngs = {"dropout": rng1, "params": aqt_rng}
   logits, intermediate_outputs = model.apply(
       params,
       data["inputs"],
@@ -392,7 +395,7 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
       decoder_segment_ids=data["inputs_segmentation"],
       encoder_images=data["images"] if config.use_multimodal else None,
       enable_dropout=config.enable_dropout if is_train else False,
-      rngs={"dropout": rng1, "params": aqt_rng},
+      rngs=rngs,
       mutable="intermediates",
   )
   one_hot_targets = jax.nn.one_hot(data["targets"], config.vocab_size)
@@ -602,7 +605,10 @@ def setup_mesh_and_model(config, devices=None):
 
   # Model and Optimizer definition
   quant = quantizations.configure_quantization(config)
-  model = Transformer(config, mesh, quant=quant)
+  if config.use_mmpp:
+    model = mmpp.Transformer(config, mesh, quant)
+  else:
+    model = Transformer(config, mesh, quant=quant)
   learning_rate_schedule = maxtext_utils.create_learning_rate_schedule(config)
   tx = optimizers.get_optimizer(config, learning_rate_schedule)
   logger = checkpointing.setup_checkpoint_logger(config)
@@ -756,6 +762,8 @@ def train_loop(config, recorder, state=None):
       state = _merge_dpo_state(state, reference_params)
     state_mesh_shardings = _merge_dpo_state(state_mesh_shardings, state_mesh_shardings.params["params"])
 
+  _train_step = mmpp.train_step if config.use_mmpp else train_step
+
   # pylint: disable=line-too-long
   (
       functional_train,
@@ -763,7 +771,7 @@ def train_loop(config, recorder, state=None):
       out_shard_train,
       static_argnums_train,
       donate_argnums_train,
-  ) = maxtext_utils.get_functional_train_with_signature(train_step, mesh, state_mesh_shardings, model, config)
+  ) = maxtext_utils.get_functional_train_with_signature(_train_step, mesh, state_mesh_shardings, model, config)
 
   if eval_data_iterator:
     # pylint: disable=line-too-long
@@ -794,15 +802,28 @@ def train_loop(config, recorder, state=None):
     p_eval_step = None
     print("Loaded compiled function!", flush=True)
   else:
-    p_train_step = jax.jit(
-        functional_train,
-        in_shardings=in_shard_train,
-        out_shardings=out_shard_train,
-        static_argnums=static_argnums_train,
-        donate_argnums=donate_argnums_train,
-    )
+    if config.use_mmpp:
+      state, init_rng, p_train_step = mmpp.prepare_state_and_train_step(
+          mesh,
+          model,
+          state,
+          init_rng,
+          functional_train,
+          in_shard_train,
+          out_shard_train,
+          next(data_iterator),
+      )
+    else:
+      p_train_step = jax.jit(
+          functional_train,
+          in_shardings=in_shard_train,
+          out_shardings=out_shard_train,
+          static_argnums=static_argnums_train,
+          donate_argnums=donate_argnums_train,
+      )
 
     if eval_data_iterator:
+      assert not config.use_mmpp
       p_eval_step = jax.jit(
           functional_eval,
           in_shardings=in_shard_eval,
@@ -816,7 +837,10 @@ def train_loop(config, recorder, state=None):
   running_gcs_metrics = [] if config.gcs_metrics else None
   metrics = None
 
-  start_step = get_first_step(state)  # this is the start_step for training
+  if config.use_mmpp:
+    start_step = 0
+  else:
+    start_step = get_first_step(state)  # this is the start_step for training
   prof = profiler.Profiler(config, offset_step=start_step)
   first_profiling_step = prof.start_initial_profile_step
   if config.profiler != "" and first_profiling_step >= config.steps:
@@ -957,7 +981,7 @@ def train_loop(config, recorder, state=None):
   metric_logger.write_metrics(running_gcs_metrics, metrics, config.steps - 1)  # final step metrics
   max_utils.close_summary_writer(writer)
 
-  if example_batch:
+  if example_batch and not config.use_mmpp:
     with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
       # pytype: disable=attribute-error
       compiled = p_train_step.lower(state, example_batch, nextrng).compile()

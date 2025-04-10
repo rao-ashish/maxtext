@@ -199,19 +199,19 @@ class Decoder(nn.Module):
 
   def setup(self):
     """Initialize decoder layer."""
-    self.decoder_layer = self.get_decoder_layers()
-    self.norm_layer = self.get_norm_layer()
+    self.decoder_layer = self.get_decoder_layers(self.config)
+    self.norm_layer = self.get_norm_layer(self.config)
     if self.config.using_pipeline_parallelism:
       pipeline_stage_module = self.get_pipeline_stage_module(self.decoder_layer)
-      remat_policy = self.get_remat_policy()
+      remat_policy = self.get_remat_policy(self.config)
       self.pipeline_module = pipeline.Pipeline(
           config=self.config, mesh=self.mesh, layers=pipeline_stage_module, remat_policy=remat_policy
       )
 
-  def get_remat_policy(self):
+  @staticmethod
+  def get_remat_policy(cfg):
     """Get remat policy"""
     policy = None
-    cfg = self.config
     if cfg.remat_policy != "none":
       if cfg.remat_policy == "minimal":
         policy = jax.checkpoint_policies.checkpoint_dots_with_no_batch_dims
@@ -310,64 +310,66 @@ class Decoder(nn.Module):
       RemattedBlockLayers.append(layer)
     return RemattedBlockLayers
 
-  def get_decoder_layers(self):
+  @staticmethod
+  def get_decoder_layers(cfg):
     """Get decoder layers, one of `DecoderBlockType` discriminants or a direct `nn.Module` inheritor"""
-    if self.config.decoder_block == DecoderBlockType.DEFAULT:
+    if cfg.decoder_block == DecoderBlockType.DEFAULT:
       return [DecoderLayer]
-    elif self.config.decoder_block == DecoderBlockType.LLAMA2:
+    elif cfg.decoder_block == DecoderBlockType.LLAMA2:
       from MaxText.layers import llama2  # pylint: disable=import-outside-toplevel
 
       return [llama2.LlamaDecoderLayer]
-    elif self.config.decoder_block == DecoderBlockType.MISTRAL:
+    elif cfg.decoder_block == DecoderBlockType.MISTRAL:
       # TODO(ranran): update to Mistral with sliding window attention
       from MaxText.layers import mistral  # pylint: disable=import-outside-toplevel
 
       return [mistral.MistralDecoderLayer]
-    elif self.config.decoder_block == DecoderBlockType.MIXTRAL:
+    elif cfg.decoder_block == DecoderBlockType.MIXTRAL:
       from MaxText.layers import mixtral  # pylint: disable=import-outside-toplevel
 
       return [mixtral.MixtralDecoderLayer]
-    elif self.config.decoder_block == DecoderBlockType.DEEPSEEK:
+    elif cfg.decoder_block == DecoderBlockType.DEEPSEEK:
       from MaxText.layers import deepseek  # pylint: disable=import-outside-toplevel
 
       return [deepseek.DeepSeekDenseLayer, deepseek.DeepSeekMoELayer]
-    elif self.config.decoder_block == DecoderBlockType.GEMMA:
+    elif cfg.decoder_block == DecoderBlockType.GEMMA:
       from MaxText.layers import gemma  # pylint: disable=import-outside-toplevel
 
       return [gemma.GemmaDecoderLayer]
-    elif self.config.decoder_block == DecoderBlockType.GEMMA2:
+    elif cfg.decoder_block == DecoderBlockType.GEMMA2:
       from MaxText.layers import gemma2  # pylint: disable=import-outside-toplevel
 
       return [gemma2.Gemma2DecoderLayer]
-    elif self.config.decoder_block == DecoderBlockType.GEMMA3:
+    elif cfg.decoder_block == DecoderBlockType.GEMMA3:
       from MaxText.layers import gemma3  # pylint: disable=import-outside-toplevel
 
       return [gemma3.Gemma3DecoderLayer]
-    elif self.config.decoder_block == DecoderBlockType.GPT3:
+    elif cfg.decoder_block == DecoderBlockType.GPT3:
       from MaxText.layers import gpt3  # pylint: disable=import-outside-toplevel
 
       return [gpt3.Gpt3DecoderLayer]
-    elif self.config.decoder_block == DecoderBlockType.SIMPLE:
+    elif cfg.decoder_block == DecoderBlockType.SIMPLE:
       from MaxText.layers import simple_layer  # pylint: disable=import-outside-toplevel
 
       return [simple_layer.SimpleDecoderLayer]
-    elif self.config.decoder_block == DecoderBlockType.SIMPLE_MLP:
+    elif cfg.decoder_block == DecoderBlockType.SIMPLE_MLP:
       from MaxText.layers import simple_layer  # pylint: disable=import-outside-toplevel
 
       return [simple_layer.SimpleMlpDecoderLayer]
-    elif self.config.decoder_block == DecoderBlockType.LLAMA4:
+    elif cfg.decoder_block == DecoderBlockType.LLAMA4:
       from MaxText.layers import llama4  # pylint: disable=import-outside-toplevel
 
-      if self.config.scan_layers:
+      if cfg.scan_layers:
         return [llama4.Llama4ScannableBlock]
       else:
         return [llama4.Llama4DecoderLayer]
     else:
-      raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block.value=}")
+      raise ValueError(f"Incorrect decoder_block name {cfg.decoder_block.value=}")
 
-  def get_norm_layer(self):
+  @staticmethod
+  def get_norm_layer(cfg):
     """get normalization layer (return type inherits from nn.Module)"""
-    if self.config.decoder_block in (
+    if cfg.decoder_block in (
         DecoderBlockType.DEFAULT,
         DecoderBlockType.LLAMA2,
         DecoderBlockType.MISTRAL,
@@ -381,12 +383,12 @@ class Decoder(nn.Module):
         DecoderBlockType.LLAMA4,
     ):
       return RMSNorm
-    elif self.config.decoder_block == DecoderBlockType.GPT3:
+    elif cfg.decoder_block == DecoderBlockType.GPT3:
       from MaxText.layers import gpt3  # pylint: disable=import-outside-toplevel
 
       return functools.partial(gpt3.Gpt3LayerNorm, reductions_in_fp32=False, use_bias=True)
     else:
-      raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block.value=}")
+      raise ValueError(f"Incorrect decoder_block name {cfg.decoder_block.value=}")
 
   def scan_decoder_layers(self, cfg, decoder_layer, length, metdata_axis_name, mesh, **kwargs):
     """scan decoder layers, calls `flax.linen.transforms.scan`"""
@@ -429,7 +431,7 @@ class Decoder(nn.Module):
     cfg = self.config
     base_stage = get_layer_to_pipeline(decoder_blocks, cfg)
     if cfg.set_remat_policy_on_layers_per_stage:
-      policy = self.get_remat_policy()
+      policy = self.get_remat_policy(self.config)
       base_stage = self.set_remat_policy([base_stage], policy)[0]
     if cfg.num_layers_per_pipeline_stage == 1:
       stage_module = base_stage(config=cfg, mesh=self.mesh, quant=self.quant)
@@ -496,7 +498,7 @@ class Decoder(nn.Module):
           config=cfg,
       )(decoder_positions)
 
-    policy = self.get_remat_policy()
+    policy = self.get_remat_policy(self.config)
     RemattedBlockLayers = self.set_remat_policy(self.decoder_layer, policy)
 
     if cfg.using_pipeline_parallelism:
@@ -648,7 +650,7 @@ class Decoder(nn.Module):
                 slot=slot,
                 **layer_call_kwargs,
             )
-    y = self.get_norm_layer()(
+    y = self.get_norm_layer(self.config)(
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
         name="decoder_norm",
