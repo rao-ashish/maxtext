@@ -269,6 +269,8 @@ def transform(
   # Phase 2: Produce final jitted sections
   print('PHASE2')
 
+  compiled_section_fns = {}
+
   def jit_with_shardings(
       section_name, section_fn, *, static_argnums=None, donate_argnums=None
   ):
@@ -287,7 +289,10 @@ def transform(
     def apply_stage(*args):
       check_args_mesh(section_name, stage_mesh, args)
       with stage_mesh:
-        return jitted_section_fn(*args)
+        if section_name not in compiled_section_fns:
+          compiled_section_fns[section_name] = jitted_section_fn.lower(*args).compile()
+          print(f"COMPILED {section_name=}")
+        return compiled_section_fns[section_name](*args)
     return apply_stage
 
   ctx = Context(
