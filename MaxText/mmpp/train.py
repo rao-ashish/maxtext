@@ -6,7 +6,9 @@ from functools import partial
 from typing import Any, Callable
 
 from flax import linen as nn
+from flax.linen import partitioning as nn_partitioning
 from flax.training import train_state
+
 import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
@@ -21,15 +23,20 @@ from MaxText.mmpp import utils
 def model_fwd_and_bwd(model, stage_index):
   num_stages = model.num_logical_stages
 
-  fwd = partial(models.forward, model, stage_index)
-
-  def bwd(params, acts, data, rng, out_cot):
-    fwd_partial = lambda params, acts: fwd(params, acts, data, rng)
-    _, fwd_vjp, *_ = jax.vjp(fwd_partial, params, acts, has_aux=(stage_index == num_stages - 1))
-    return fwd_vjp(out_cot)
+  fwd, bwd = utils.fwd_and_bwd(
+    partial(models.forward, model, stage_index),
+    # Take vjp wrt params and input activations
+    argnums=(0, 1),
+    # Caller saves params (to avoid duplicating in vjp residuals)
+    caller_saved_among_argnums=(True, False,),
+    has_aux=(stage_index == num_stages - 1),
+    jitted=False,
+  )
 
   fwd.__name__ = f"forward{stage_index}"
   bwd.__name__ = f"backward{stage_index}"
+  fwd = utils.with_vjp_unpack(fwd)
+  bwd = utils.with_vjp_pack(bwd)
   return fwd, bwd
 
 
@@ -52,14 +59,11 @@ def init_stage_grads(param_infos, stage_index):
 def fwd_stage(fwd, params, input_activations, data, rng, mubatch_idx):
   mubatch_data = jax.tree.map(lambda x: x[mubatch_idx], data)
   res = fwd(params, input_activations, mubatch_data, rng)
-  if not isinstance(res, tuple):
-    res = (res,)
-  return params, input_activations, *res
+  return params, *res
 
 
-def bwd_stage(bwd, params, acts, data, rng, mubatch_idx, out_cot, grads_acc):
-  mubatch_data = jax.tree.map(lambda x: x[mubatch_idx], data)
-  grads, in_cot = bwd(params, acts, mubatch_data, rng, out_cot)
+def bwd_stage(bwd, params, stashed, out_cot, grads_acc):
+  grads, in_cot = bwd(stashed, out_cot, params)
   grads_acc = jax.tree.map(jnp.add, grads_acc, grads)
   return params, grads_acc, in_cot
 
@@ -284,7 +288,7 @@ def value_and_grad(
             transfer(stage_idx, dropout_rng),
             constant(stage_idx, mubatch_idx),
         )
-        params_by_stage[stage_idx], fwd_input[curr_id], activation = res[:3]
+        params_by_stage[stage_idx], activation, stashed[curr_id] = res[:3]
         if stage_idx == num_stages - 1:
           loss[mubatch_idx] = activation
           aux[mubatch_idx] = res[3]
@@ -300,14 +304,11 @@ def value_and_grad(
         succ_id = (mubatch_idx, stage_idx-1)
         _bwd = ctx.section(
             (mpmd.SectionKind.Backward, stage_idx),
-            donate_argnums=(0,1,2,3,4,5,6),
+            donate_argnums=(0,1,2,3),
         )
         params_by_stage[stage_idx], grads_by_stage[stage_idx], activation_cot = _bwd(
             params_by_stage[stage_idx],
-            fwd_input.pop(curr_id),
-            data_by_stage[stage_idx],
-            transfer(stage_idx, dropout_rng),
-            constant(stage_idx, mubatch_idx),
+            stashed.pop(curr_id),
             bwd_input.pop(curr_id),
             grads_by_stage[stage_idx],
         )
@@ -398,13 +399,14 @@ def prepare_state_and_train_step(
   # Replicate init_rng
   init_rng = jax.device_put(init_rng, device=NamedSharding(mesh, PartitionSpec()))
 
-  p_train_step = mpmd.transform(
-      mesh,
-      get_section_fns(model, state),
-      functional_train,
-      in_shard_train,
-      out_shard_train,
-      (state, example_data, init_rng),
-  )
+  with nn_partitioning.axis_rules(model.config.logical_axis_rules):
+    p_train_step = mpmd.transform(
+        mesh,
+        get_section_fns(model, state),
+        functional_train,
+        in_shard_train,
+        out_shard_train,
+        (state, example_data, init_rng),
+    )
 
   return state, init_rng, p_train_step

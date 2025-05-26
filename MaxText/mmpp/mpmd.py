@@ -238,7 +238,7 @@ def transform(
     section_decorator=dump_section_shardings,
   )
   stage0_mesh = ctx.get_stage_mesh(0)
-  with set_context(ctx):
+  with set_context(ctx), stage0_mesh:
     jax.jit(
         step_fn,
         in_shardings=adjust_to_stage_mesh(stage0_mesh, step_in_shardings),
@@ -291,7 +291,6 @@ def transform(
       with stage_mesh:
         if section_name not in compiled_section_fns:
           compiled_section_fns[section_name] = jitted_section_fn.lower(*args).compile()
-          print(f"COMPILED {section_name=}")
         return compiled_section_fns[section_name](*args)
     return apply_stage
 
