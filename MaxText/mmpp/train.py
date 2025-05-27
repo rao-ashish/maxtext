@@ -337,6 +337,8 @@ def train_step(model, config, _state_mesh_shardings, state_by_stage, data, dropo
   assert not config.record_internal_nn_metrics
   assert not config.enable_dropout
 
+  assert nn.get_logical_axis_rules() != (), f"expected some linen logical axis rules"
+
   ctx = mpmd.get_context()
   num_stages = model.num_logical_stages
   num_mubatches = 1 if ctx.tracing_for_inference else config.num_pipeline_microbatches
