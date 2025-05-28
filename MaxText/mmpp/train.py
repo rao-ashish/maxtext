@@ -22,21 +22,35 @@ from MaxText.mmpp import utils
 
 def model_fwd_and_bwd(model, stage_index):
   num_stages = model.num_logical_stages
-
   fwd, bwd = utils.fwd_and_bwd(
     partial(models.forward, model, stage_index),
     # Take vjp wrt params and input activations
     argnums=(0, 1),
     # Caller saves params (to avoid duplicating in vjp residuals)
-    caller_saved_among_argnums=(True, False,),
+    caller_saved_among_argnums=(True, False),
     has_aux=(stage_index == num_stages - 1),
     jitted=False,
   )
-
   fwd.__name__ = f"forward{stage_index}"
   bwd.__name__ = f"backward{stage_index}"
+
+  # Workaround for vjp API (to allow specifying shardings for stashed)
   fwd = utils.with_vjp_unpack(fwd)
   bwd = utils.with_vjp_pack(bwd)
+
+  # DP-vmap-trick: vmap both fwd and bwd
+  # TODO: Pass spmd_axis="data" to vmap?
+  fwd = jax.vmap(
+    fwd,
+    in_axes=(None, 0, 0, None),  # params, acts, data, rng
+    out_axes=0,                  # acts, stashed, aux?
+  )
+  bwd = jax.vmap(
+    bwd,
+    in_axes=(0, 0, None),        # stashed, out_cot, params
+    out_axes=0,                  # grads, in_cot
+  )
+
   return fwd, bwd
 
 
@@ -56,8 +70,11 @@ def init_stage_grads(param_infos, stage_index):
   return jax.tree.map(zeros_like_param, param_infos)
 
 
-def fwd_stage(fwd, params, input_activations, data, rng, mubatch_idx):
+def fwd_stage(fwd, dp_factor, params, input_activations, data, rng, mubatch_idx):
+  # Slice out the microbatch
   mubatch_data = jax.tree.map(lambda x: x[mubatch_idx], data)
+  # DP-vmap-trick: reshape data to factor out DP axis
+  mubatch_data = jax.tree.map(lambda x: x.reshape((dp_factor, -1, *x.shape[1:])), mubatch_data)
   res = fwd(params, input_activations, mubatch_data, rng)
   return params, *res
 
@@ -71,18 +88,29 @@ def bwd_stage(bwd, params, stashed, out_cot, grads_acc):
 def update_stage_state(tx, params, opt_state, grads):
   # No OWG: https://github.com/google/flax/blob/240a5107c02d60c171098fbc3f2738d8b6f5ba75/flax/training/train_state.py#L108-L110
   assert nn.fp8_ops.OVERWRITE_WITH_GRADIENT not in grads
+  # DP-vmap-trick: explicitly reduce across DP axis
+  grads = jax.tree.map(lambda x: jnp.sum(x, axis=0), grads)
   updates, new_opt_state = tx.update(grads, opt_state, params)
   new_params = optax.apply_updates(params, updates)
   return new_params, new_opt_state
 
 
 def get_section_fns(model, state_by_stage) -> dict[mpmd.SectionName, Callable]:
+  dp_factor = model.mesh.shape["data"]
+
+  def make_param_info(p):
+    # DP-vmap-trick: prepend DP dimension to grads_acc
+    shape = (dp_factor,) + p.shape
+    spec = PartitionSpec("data", *p.sharding.spec)
+    sharding = NamedSharding(p.sharding.mesh, spec)
+    return ParamInfo(shape, p.dtype, sharding)
+
   section_fns = {}
   for stage_index, state in enumerate(state_by_stage):
     fwd, bwd = model_fwd_and_bwd(model, stage_index)
-    param_infos = jax.tree.map(lambda x: ParamInfo(x.shape, x.dtype, x.sharding), state.params)
+    param_infos = jax.tree.map(make_param_info, state.params)
     section_fns[(mpmd.SectionKind.Prologue, stage_index)] = partial(init_stage_grads, param_infos, stage_index)
-    section_fns[(mpmd.SectionKind.Forward, stage_index)] = partial(fwd_stage, fwd)
+    section_fns[(mpmd.SectionKind.Forward, stage_index)] = partial(fwd_stage, fwd, dp_factor)
     section_fns[(mpmd.SectionKind.Backward, stage_index)] = partial(bwd_stage, bwd)
     section_fns[(mpmd.SectionKind.Epilogue, stage_index)] = partial(update_stage_state, state.tx)
   return section_fns
@@ -155,12 +183,14 @@ def update_state(ctx, old_state_by_stage, grads_by_stage):
 
 ### Transfer state and input data to the corresponding stages' meshes
 
-def constant(stage_idx, const):
+def constant(stage_idx, const, *, shape=(), spec=PartitionSpec()):
   ctx = mpmd.get_context()
-  if ctx.tracing_for_inference:
-    return const
   stage_mesh = ctx.get_stage_mesh(stage_idx)
-  return jax.device_put(const, device=NamedSharding(stage_mesh, PartitionSpec()))
+  sharding = NamedSharding(stage_mesh, spec)
+  arr = jnp.full(shape, const, device=sharding)
+  if ctx.tracing_for_inference:
+    return arr
+  return jax.device_put(arr, device=sharding)
 
 
 def transfer(stage_idx, xs):
@@ -198,6 +228,7 @@ def value_and_grad(
     print_memory_usage=False,
 ):
   assert num_stages == len(params_by_stage) == len(data_by_stage)
+  dp_factor = ctx.mesh.shape["data"]
 
   ### Schedule
   tasks = [
@@ -233,7 +264,11 @@ def value_and_grad(
   stashed = {}
   # bwd_input : (mubatch_idx, stage_idx) -> activation
   bwd_input = {
-    (mubatch_idx, num_stages-1): constant(num_stages-1, 1.0)
+    (mubatch_idx, num_stages-1): constant(
+        num_stages-1, 1.0,
+        # DP-vmap-trick: prepend DP dimension to loss_cot
+        shape=(dp_factor,), spec=PartitionSpec("data"),
+    )
     for mubatch_idx in range(num_mubatches)
   }
   # grads_by_stage : stage_idx -> grads
@@ -320,7 +355,7 @@ def value_and_grad(
         del activation_cot
     memory_usage_snapshot(task_name)
 
-  stack_mean = lambda x: jnp.mean(jnp.stack(x), axis=0)
+  stack_mean = lambda x: jnp.mean(jnp.stack(x), axis=(0,1))
   loss = stack_mean(loss)
   aux = jax.tree.map(lambda *xs: stack_mean(xs), *aux)
   return params_by_stage, grads_by_stage, (loss, aux)
