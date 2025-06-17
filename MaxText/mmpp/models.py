@@ -38,7 +38,6 @@ class Transformer(nn.Module):
     assert not cfg.trainable_position_size > 0
     assert not cfg.logits_via_embedding                  # no weight sharing
     assert not cfg.set_remat_policy_on_layers_per_stage  # we control remat manually
-    assert cfg.scan_layers
 
     decoder_layers = models.Decoder.get_decoder_layers(cfg)
     assert len(decoder_layers) == 1, f"unsupported decoder block: {cfg.decoder_block}"
@@ -83,9 +82,18 @@ class Transformer(nn.Module):
     name = f"stage{stage_index}_layers"
     if num_layers_in_stage == 1:
       stage_module = base_stage(config=cfg, mesh=stage_mesh, quant=self.quant, name=name)
-    else:
+    elif cfg.scan_layers:
       stage_module = self.scan_decoder_layers(
           cfg, stage_mesh, base_stage, num_layers_in_stage, name
+      )
+    else:
+      stage_module = models.SequentialBlockDecoderLayers(
+          decoder_layer=base_stage,
+          num_decoder_layers=num_layers_in_stage,
+          config=cfg,
+          mesh=stage_mesh,
+          quant=self.quant,
+          name=name,
       )
     return stage_module
 
