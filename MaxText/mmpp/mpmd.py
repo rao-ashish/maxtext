@@ -117,25 +117,29 @@ def is_jax_partial(x):
 
 
 def sharding_extractor():
-  def should_infer_sharding(x):
+  def get_shape(x):
     try:
       aval = jax.core.get_aval(x)
-      return type(aval) is jax.core.ShapedArray
+      if type(aval) is jax.core.ShapedArray:
+        return aval.shape
     except TypeError:
-      return False
+      pass
+    return None
 
-  def store(shardings, index, sharding):
+  def check_and_store(shape, shardings, index, sharding):
+    sharding.shard_shape(shape)
     shardings[index] = sharding
 
   def register_store_callbacks(xs):
     xs_flat, xs_tree = jax.tree.flatten(xs, is_leaf=is_jax_partial)
     shardings = [None] * len(xs_flat)
     for index, x in enumerate(xs_flat):
-      if should_infer_sharding(x):
-        inspect_array_sharding(x, callback=partial(store, shardings, index))
+      if shape := get_shape(x):
+        callback = partial(check_and_store, shape, shardings, index)
+        inspect_array_sharding(x, callback=callback)
       else:
         # Note that we end up here for jax Partials (because we first treat them
-        # as leaves and then decide not to infer a sharding for them). Simply
+        # as leaves and then decide not to inspect the sharding for them). Simply
         # setting the inferred sharding to None means the Partials do not show
         # up in the inferred shardings; jax will treat these as replicated, but
         # all the data packaged in the Partial will have been replaced by dummy
@@ -274,10 +278,11 @@ def transform(
   def jit_with_shardings(
       section_name, section_fn, *, static_argnums=None, donate_argnums=None
   ):
-    _, stage_index = section_name
+    section_kind, stage_index = section_name
     stage_mesh = get_stage_mesh(mesh, stage_index)
     in_shardings = adjust_to_stage_mesh(stage_mesh, section_in_shardings[section_name])
     out_shardings = adjust_to_stage_mesh(stage_mesh, section_out_shardings[section_name])
+    section_fn.__name__ = f"section_{section_kind.name}{stage_index}"
     jitted_section_fn = jax.jit(
         section_fn,
         in_shardings=in_shardings,
