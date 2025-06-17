@@ -70,11 +70,9 @@ def init_stage_grads(param_infos, stage_index):
   return jax.tree.map(zeros_like_param, param_infos)
 
 
-def fwd_stage(fwd, dp_factor, params, input_activations, data, rng, mubatch_idx):
+def fwd_stage(fwd, params, input_activations, data, rng, mubatch_idx):
   # Slice out the microbatch
   mubatch_data = jax.tree.map(lambda x: x[mubatch_idx], data)
-  # DP-vmap-trick: reshape data to factor out DP axis
-  mubatch_data = jax.tree.map(lambda x: x.reshape((dp_factor, -1, *x.shape[1:])), mubatch_data)
   res = fwd(params, input_activations, mubatch_data, rng)
   return params, *res
 
@@ -110,7 +108,7 @@ def get_section_fns(model, state_by_stage) -> dict[mpmd.SectionName, Callable]:
     fwd, bwd = model_fwd_and_bwd(model, stage_index)
     param_infos = jax.tree.map(make_param_info, state.params)
     section_fns[(mpmd.SectionKind.Prologue, stage_index)] = partial(init_stage_grads, param_infos, stage_index)
-    section_fns[(mpmd.SectionKind.Forward, stage_index)] = partial(fwd_stage, fwd, dp_factor)
+    section_fns[(mpmd.SectionKind.Forward, stage_index)] = partial(fwd_stage, fwd)
     section_fns[(mpmd.SectionKind.Backward, stage_index)] = partial(bwd_stage, bwd)
     section_fns[(mpmd.SectionKind.Epilogue, stage_index)] = partial(update_stage_state, state.tx)
   return section_fns
@@ -376,12 +374,14 @@ def train_step(model, config, _state_mesh_shardings, state_by_stage, data, dropo
 
   ctx = mpmd.get_context()
   num_stages = model.num_logical_stages
-  num_mubatches = 1 if ctx.tracing_for_inference else config.num_pipeline_microbatches
+  # TODO: When ctx.tracing_for_inference, only unroll microbatching loop for first iteration
+  num_mubatches = config.num_pipeline_microbatches
+  dp_factor = model.mesh.shape["data"]
 
   # TODO: Investigate whether this replication and resharding is a bottleneck
   def reshape_reshard_data(arr):
-    arr = arr.reshape((num_mubatches, -1, *arr.shape[1:]))
-    return nn.with_logical_constraint(arr, (None, "activation_batch",))
+    arr = arr.reshape((num_mubatches, dp_factor, -1, *arr.shape[1:]))
+    return nn.with_logical_constraint(arr, (None, "activation_embed_and_logits_batch_outside_vmap",))
   data = jax.tree.map(reshape_reshard_data, data)
   data_by_stage = tuple(
     transfer(stage_index, data)  # replicate, it's (relatively) cheap and might overlap?
@@ -436,7 +436,7 @@ def prepare_state_and_train_step(
   # Replicate init_rng
   init_rng = jax.device_put(init_rng, device=NamedSharding(mesh, PartitionSpec()))
 
-  with nn_partitioning.axis_rules(model.config.logical_axis_rules):
+  with mesh, nn_partitioning.axis_rules(model.config.logical_axis_rules):
     p_train_step = mpmd.transform(
         mesh,
         get_section_fns(model, state),
