@@ -44,11 +44,13 @@ def model_fwd_and_bwd(model, stage_index):
     fwd,
     in_axes=(None, 0, 0, None),  # params, acts, data, rng
     out_axes=0,                  # acts, stashed, aux?
+    spmd_axis_name="data",
   )
   bwd = jax.vmap(
     bwd,
     in_axes=(0, 0, None),        # stashed, out_cot, params
     out_axes=0,                  # grads, in_cot
+    spmd_axis_name="data",
   )
 
   return fwd, bwd
