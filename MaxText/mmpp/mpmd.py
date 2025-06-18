@@ -36,7 +36,7 @@ def adjust_to_stage_mesh(stage_mesh, shardings):
   return jax.tree.map(partial(sharding_with_mesh, mesh=stage_mesh), shardings)
 
 
-SectionKind = Enum('SectionKind', 'Prologue Forward Backward Epilogue')
+SectionKind = Enum('SectionKind', 'Prologue Forward Backward BackwardLast Epilogue')
 StageIndex = int
 SectionName = tuple[SectionKind, StageIndex]
 
