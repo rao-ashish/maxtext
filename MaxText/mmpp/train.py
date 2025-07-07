@@ -190,14 +190,18 @@ def update_state(ctx, old_state_by_stage, grads_by_stage):
 
 ### Transfer state and input data to the corresponding stages' meshes
 
-def constant(stage_idx, const, *, shape=(), spec=PartitionSpec()):
+def _constant(stage_idx, const, *, shape=(), spec=PartitionSpec()):
   ctx = mpmd.get_context()
   stage_mesh = ctx.get_stage_mesh(stage_idx)
   sharding = NamedSharding(stage_mesh, spec)
   arr = jnp.full(shape, const, device=sharding)
   if ctx.tracing_for_inference:
     return arr
-  return jax.device_put(arr, device=sharding)
+  return arr
+
+def constant(stage_idx, const, *, shape=(), spec=PartitionSpec()):
+  with utils.annotate(f"const {stage_idx=} {const=} {shape=}", color="yellow"):
+    return _constant(stage_idx, const, shape=shape, spec=spec)
 
 
 def transfer(stage_idx, xs):
@@ -269,15 +273,6 @@ def value_and_grad(
   }
   # stashed : (mubatch_idx, stage_idx) -> stashed residuals
   stashed = {}
-  # bwd_input : (mubatch_idx, stage_idx) -> activation
-  bwd_input = {
-    (mubatch_idx, num_stages-1): constant(
-        num_stages-1, 1.0,
-        # DP-vmap-trick: prepend DP dimension to loss_cot
-        shape=(dp_factor,), spec=PartitionSpec("data"),
-    )
-    for mubatch_idx in range(num_mubatches)
-  }
   # grads_by_stage : stage_idx -> grads
   grads_by_stage = []
   for stage_idx in range(num_stages):
@@ -288,6 +283,26 @@ def value_and_grad(
   # loss : mubatch_idx -> loss
   loss = [None] * num_mubatches
   aux = [None] * num_mubatches
+  # bwd_input : (mubatch_idx, stage_idx) -> activation
+  bwd_input = {
+    (mubatch_idx, num_stages-1): constant(
+        num_stages-1, 1.0,
+        # DP-vmap-trick: prepend DP dimension to loss_cot
+        shape=(dp_factor,), spec=PartitionSpec("data"),
+    )
+    for mubatch_idx in range(num_mubatches)
+  }
+
+  # mubatch_idx_consts : (mubatch_idx, stage_idx) -> const
+  mubatch_idx_consts = {
+    (mubatch_idx, stage_idx): constant(stage_idx, mubatch_idx)
+    for mubatch_idx in range(num_mubatches)
+    for stage_idx in range(num_stages)
+  }
+  dropout_rngs = tuple(
+    transfer(stage_idx, dropout_rng)
+    for stage_idx in range(num_stages)
+  )
 
   def memory_usage_snapshot(name):
     if not print_memory_usage or ctx.tracing_for_inference:
@@ -327,8 +342,8 @@ def value_and_grad(
             params_by_stage[stage_idx],
             fwd_input.pop(curr_id),
             data_by_stage[stage_idx],
-            transfer(stage_idx, dropout_rng),
-            constant(stage_idx, mubatch_idx),
+            dropout_rngs[stage_idx],
+            mubatch_idx_consts[(mubatch_idx, stage_idx)],
         )
         params_by_stage[stage_idx], activation, stashed[curr_id] = res[:3]
         if stage_idx == num_stages - 1:
