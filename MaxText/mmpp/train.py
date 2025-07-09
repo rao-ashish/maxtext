@@ -112,17 +112,11 @@ def bwd_stage(bwd, params, stashed, out_cot, grads_acc):
   return params, grads_acc, in_cot
 
 
-def bwd_stage_last(bwd, params, stashed, out_cot, grads_acc):
-  """bwd_stage for the last mubatch, so we also reduce gradients across DP replicas."""
-  params, grads_acc, in_cot = bwd_stage(bwd, params, stashed, out_cot, grads_acc)
-  # DP-vmap-trick: explicitly reduce across DP axis
-  grads = jax.tree.map(lambda x: jnp.sum(x, axis=0), grads_acc)
-  return params, grads, in_cot
-
-
 def update_stage_state(tx, params, opt_state, grads):
   # No OWG: https://github.com/google/flax/blob/240a5107c02d60c171098fbc3f2738d8b6f5ba75/flax/training/train_state.py#L108-L110
   assert nn.fp8_ops.OVERWRITE_WITH_GRADIENT not in grads
+  # DP-vmap-trick: explicitly reduce across DP axis
+  grads = jax.tree.map(lambda x: jnp.sum(x, axis=0), grads)
   updates, new_opt_state = tx.update(grads, opt_state, params)
   new_params = optax.apply_updates(params, updates)
   return new_params, new_opt_state
@@ -138,7 +132,6 @@ def get_section_fns(model, state_by_stage) -> dict[mpmd.SectionName, Callable]:
     section_fns[(mpmd.SectionKind.Prologue, stage_index)] = init_stage
     section_fns[(mpmd.SectionKind.Forward, stage_index)] = partial(fwd_stage, fwd)
     section_fns[(mpmd.SectionKind.Backward, stage_index)] = partial(bwd_stage, bwd)
-    section_fns[(mpmd.SectionKind.BackwardLast, stage_index)] = partial(bwd_stage_last, bwd)
     section_fns[(mpmd.SectionKind.Epilogue, stage_index)] = partial(update_stage_state, state.tx)
   return section_fns
 
@@ -377,7 +370,7 @@ def value_and_grad(
         ### Backward
         succ_id = (mubatch_idx, stage_idx-1)
         _bwd = ctx.section(
-            (mpmd.SectionKind.BackwardLast if mubatch_idx == num_mubatches - 1 else mpmd.SectionKind.Backward, stage_idx),
+            (mpmd.SectionKind.Backward, stage_idx),
             donate_argnums=(0,1,2,3),
         )
         params_by_stage[stage_idx], grads_by_stage[stage_idx], activation_cot = _bwd(
