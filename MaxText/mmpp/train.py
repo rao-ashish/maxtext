@@ -63,13 +63,40 @@ class ParamInfo:
   sharding: Any
 
 
-def init_stage_grads(param_infos, stage_index):
-  stage_mesh = mpmd.get_context().get_stage_mesh(stage_index)
-  def zeros_like_param(pi):
-    zeros = jnp.zeros(pi.shape, dtype=pi.dtype)
-    sharding = mpmd.sharding_with_mesh(pi.sharding, stage_mesh)
-    return jax.lax.with_sharding_constraint(zeros, sharding)
-  return jax.tree.map(zeros_like_param, param_infos)
+def make_init_stage(num_mubatches, dp_factor, params, stage_index):
+  # NB: We compute param_infos outside init_stage, so it doesn't capture params!
+  def make_param_info(p):
+    # DP-vmap-trick: prepend DP dimension to grads_acc
+    shape = (dp_factor,) + p.shape
+    spec = PartitionSpec("data", *p.sharding.spec)
+    sharding = NamedSharding(p.sharding.mesh, spec)
+    return ParamInfo(shape, p.dtype, sharding)
+  param_infos = jax.tree.map(make_param_info, params)
+
+  def init_stage():
+    stage_mesh = mpmd.get_context().get_stage_mesh(stage_index)
+
+    # Gradient accumulators
+    def zeros_like_param(pi):
+      zeros = jnp.zeros(pi.shape, dtype=pi.dtype)
+      sharding = mpmd.sharding_with_mesh(pi.sharding, stage_mesh)
+      return jax.lax.with_sharding_constraint(zeros, sharding)
+    grads = jax.tree.map(zeros_like_param, param_infos)
+
+    # Constants we need to feed to fwd/bwd steps throughout the training step
+    mubatch_ones = tuple(
+      # DP-vmap-trick: prepend DP dimension to loss_cot
+      jnp.full((dp_factor,), 1.0, device=NamedSharding(stage_mesh, PartitionSpec("data")))
+      for mubatch_idx in range(num_mubatches)
+    )
+    mubatch_idx_consts = tuple(
+      jnp.full((), mubatch_idx, device=NamedSharding(stage_mesh, PartitionSpec()))
+      for mubatch_idx in range(num_mubatches)
+    )
+
+    return grads, mubatch_ones, mubatch_idx_consts
+
+  return init_stage
 
 
 def fwd_stage(fwd, params, input_activations, data, rng, mubatch_idx):
@@ -102,20 +129,13 @@ def update_stage_state(tx, params, opt_state, grads):
 
 
 def get_section_fns(model, state_by_stage) -> dict[mpmd.SectionName, Callable]:
+  num_mubatches = model.config.num_pipeline_microbatches
   dp_factor = model.mesh.shape["data"]
-
-  def make_param_info(p):
-    # DP-vmap-trick: prepend DP dimension to grads_acc
-    shape = (dp_factor,) + p.shape
-    spec = PartitionSpec("data", *p.sharding.spec)
-    sharding = NamedSharding(p.sharding.mesh, spec)
-    return ParamInfo(shape, p.dtype, sharding)
-
   section_fns = {}
   for stage_index, state in enumerate(state_by_stage):
+    init_stage = make_init_stage(num_mubatches, dp_factor, state.params, stage_index)
     fwd, bwd = model_fwd_and_bwd(model, stage_index)
-    param_infos = jax.tree.map(make_param_info, state.params)
-    section_fns[(mpmd.SectionKind.Prologue, stage_index)] = partial(init_stage_grads, param_infos, stage_index)
+    section_fns[(mpmd.SectionKind.Prologue, stage_index)] = init_stage
     section_fns[(mpmd.SectionKind.Forward, stage_index)] = partial(fwd_stage, fwd)
     section_fns[(mpmd.SectionKind.Backward, stage_index)] = partial(bwd_stage, bwd)
     section_fns[(mpmd.SectionKind.BackwardLast, stage_index)] = partial(bwd_stage_last, bwd)
@@ -273,36 +293,33 @@ def value_and_grad(
   }
   # stashed : (mubatch_idx, stage_idx) -> stashed residuals
   stashed = {}
+  # bwd_input : (mubatch_idx, stage_idx) -> activation
+  bwd_input = {}
   # grads_by_stage : stage_idx -> grads
   grads_by_stage = []
-  for stage_idx in range(num_stages):
-    _init_stage_grads = ctx.section((mpmd.SectionKind.Prologue, stage_idx))
-    with utils.annotate(f"init_grads{stage_idx}", color="green"):
-      grads = _init_stage_grads()
-    grads_by_stage.append(grads)
   # loss : mubatch_idx -> loss
   loss = [None] * num_mubatches
   aux = [None] * num_mubatches
-  # bwd_input : (mubatch_idx, stage_idx) -> activation
-  bwd_input = {
-    (mubatch_idx, num_stages-1): constant(
-        num_stages-1, 1.0,
-        # DP-vmap-trick: prepend DP dimension to loss_cot
-        shape=(dp_factor,), spec=PartitionSpec("data"),
-    )
-    for mubatch_idx in range(num_mubatches)
-  }
 
-  # mubatch_idx_consts : (mubatch_idx, stage_idx) -> const
-  mubatch_idx_consts = {
-    (mubatch_idx, stage_idx): constant(stage_idx, mubatch_idx)
-    for mubatch_idx in range(num_mubatches)
-    for stage_idx in range(num_stages)
-  }
+  # dropout_rngs : stage_idx -> dropout_rng
   dropout_rngs = tuple(
     transfer(stage_idx, dropout_rng)
     for stage_idx in range(num_stages)
   )
+  # mubatch_idx_consts_by_stage : stage_idx -> mubatch_idx -> const
+  mubatch_idx_consts_by_stage = []
+
+  ### Run initialization for each stage
+  for stage_idx in range(num_stages):
+    _init_stage = ctx.section((mpmd.SectionKind.Prologue, stage_idx))
+    with utils.annotate(f"init{stage_idx}", color="green"):
+      grads, mubatch_const_ones, idx_consts = _init_stage()
+    grads_by_stage.append(grads)
+    assert num_mubatches == len(mubatch_const_ones) == len(idx_consts)
+    mubatch_idx_consts_by_stage.append(idx_consts)
+    if stage_idx == num_stages - 1:
+      for mubatch_idx, const_ones in enumerate(mubatch_const_ones):
+        bwd_input[(mubatch_idx, stage_idx)] = const_ones
 
   def memory_usage_snapshot(name):
     if not print_memory_usage or ctx.tracing_for_inference:
@@ -343,7 +360,7 @@ def value_and_grad(
             fwd_input.pop(curr_id),
             data_by_stage[stage_idx],
             dropout_rngs[stage_idx],
-            mubatch_idx_consts[(mubatch_idx, stage_idx)],
+            mubatch_idx_consts_by_stage[stage_idx][mubatch_idx],
         )
         params_by_stage[stage_idx], activation, stashed[curr_id] = res[:3]
         if stage_idx == num_stages - 1:
