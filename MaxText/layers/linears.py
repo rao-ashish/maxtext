@@ -200,14 +200,51 @@ class DenseGeneral(nnx.Module):
     return output
 
 
+# def variable_to_logically_partitioned(variable: nnx.VariableState):
+#   metadata = variable.get_metadata()
+#   return nn.LogicallyPartitioned(  # type: ignore[wrong-keyword-args]
+#       variable.value,
+#       variable.sharding,
+#       mesh=metadata.get("mesh"),
+#       rules=metadata.get("rules"),
+#   )
+
 def variable_to_logically_partitioned(variable: nnx.VariableState):
+  """Wraps an NNX variable's value in `nn.LogicallyPartitioned`.
+
+  This function inspects the metadata of an `nnx.VariableState` object. If
+  sharding information ('sharding' or 'sharding_names') is present, it wraps
+  the variable's value in `nn.LogicallyPartitioned` to apply the specified
+  sharding constraints.
+
+  It handles special cases for `aqt_tensor.QTensor` and variables of type
+  `_overwrite_with_gradient` by returning their values directly without
+  wrapping.
+
+  Args:
+    variable: The `nnx.VariableState` object to process.
+
+  Returns:
+    The variable's value, potentially wrapped in `nn.LogicallyPartitioned`.
+  """
+
+  if variable.type.__name__ == "_overwrite_with_gradient":
+    return variable.value
+
   metadata = variable.get_metadata()
-  return nn.LogicallyPartitioned(  # type: ignore[wrong-keyword-args]
-      variable.value,
-      variable.sharding,
-      mesh=metadata.get("mesh"),
-      rules=metadata.get("rules"),
-  )
+  if "sharding" in metadata or "sharding_names" in metadata:
+    if "sharding_names" in metadata:
+      sharding_names = metadata["sharding_names"]
+    else:
+      sharding_names = metadata["sharding"]
+    return nn.LogicallyPartitioned(  # type: ignore[wrong-keyword-args]
+        variable.value,
+        sharding_names,  # type: ignore[arg-type]
+        mesh=metadata.get("mesh"),
+        rules=metadata.get("rules"),
+    )
+  else:
+    return variable.value
 
 
 def dense_general(

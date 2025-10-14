@@ -42,6 +42,7 @@ from jax.sharding import Mesh
 import jax
 import jax.numpy as jnp
 
+import flax
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
 
@@ -1012,6 +1013,8 @@ def main(argv: Sequence[str]) -> None:
   vertex_tensorboard_manager = VertexTensorboardManager()
   if config.use_vertex_tensorboard or os.environ.get("UPLOAD_DATA_TO_TENSORBOARD"):
     vertex_tensorboard_manager.configure_vertex_tensorboard(config)
+
+  flax.config.update('flax_always_shard_variable', False)
 
   # Goodput configurations
   maybe_monitor_goodput(config)

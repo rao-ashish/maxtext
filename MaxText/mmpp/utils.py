@@ -11,8 +11,9 @@ import numpy as np
 # vjp-related utils imports
 from jax._src import linear_util as lu
 from jax._src.api_util import argnums_partial, debug_info
-from jax._src.tree_util import Partial
+from jax._src.api import VJP
 from jax._src.util import tuple_update
+from jax._src.api import NotNeeded
 
 # Profiling imports
 from ctypes import cdll
@@ -22,40 +23,111 @@ import nvtx
 
 ### vjp-related utilities
 
+# def fwd_and_bwd(
+#     fun: Callable, argnums: Sequence[int], caller_saved_among_argnums: Sequence[bool],
+#     has_aux: bool = False, jitted: bool = True,
+# ) -> tuple[Callable, Callable]:
+#   def fwd(*args, **kwargs):
+#     dbg = debug_info('fwd_and_bwd', fun, args, kwargs)
+#     f = lu.wrap_init(fun, params=kwargs, debug_info=dbg)
+#     f_partial, dyn_args = argnums_partial(
+#         f, argnums, args, require_static_args_hashable=False)
+#     # return jax._src.api._saved_input_vjp(
+#     #     f_partial, caller_saved_among_argnums, *dyn_args, has_aux=has_aux)
+#     return jax._src.api.saved_input_vjp(
+#         f_partial, caller_saved_among_argnums, *dyn_args)
+#   def bwd(f_vjp, *outgrad_and_saved):
+#     assert len(outgrad_and_saved) == sum(caller_saved_among_argnums) + 1
+#     return f_vjp(*outgrad_and_saved)
+#   if jitted:
+#     fwd = jax.jit(fwd)
+#     bwd = jax.jit(bwd)
+#   return fwd, bwd
+
+
 def fwd_and_bwd(
-    fun: Callable, argnums: Sequence[int], caller_saved_among_argnums: Sequence[bool],
-    has_aux: bool = False, jitted: bool = True,
+    fun: Callable,
+    argnums: Sequence[int],
+    caller_saved_among_argnums: Sequence[bool],
+    has_aux: bool = False,
+    jitted: bool = True,
 ) -> tuple[Callable, Callable]:
-  def fwd(*args, **kwargs):
-    dbg = debug_info('fwd_and_bwd', fun, args, kwargs)
-    f = lu.wrap_init(fun, params=kwargs, debug_info=dbg)
-    f_partial, dyn_args = argnums_partial(
-        f, argnums, args, require_static_args_hashable=False)
-    return jax._src.api._saved_input_vjp(
-        f_partial, caller_saved_among_argnums, *dyn_args, has_aux=has_aux)
-  def bwd(f_vjp, *outgrad_and_saved):
-    assert len(outgrad_and_saved) == sum(caller_saved_among_argnums) + 1
-    return f_vjp(*outgrad_and_saved)
-  if jitted:
-    fwd = jit(fwd)
-    bwd = jit(bwd)
-  return fwd, bwd
+    def fwd(*args, **kwargs):
+      # f_partial is a partially evaluated version of fun that only takes in
+      # the arguments at argnums as input.
+      def f_partial(*remaining_args):
+        assert len(remaining_args) == len(argnums)
+        new_args = []
+        j = 0
+        for i in range(len(args)):
+          if i in argnums:
+            new_args.append(remaining_args[j])
+            j += 1
+          else:
+            new_args.append(args[i])
+
+        return fun(*new_args)
+      
+      # Compute the VJP of f_partial.
+      curr_remaining_args = [args[argnum] for argnum in argnums]
+      out_primals, raw_vjp, *rest = jax._src.api.vjp3(
+        f_partial, *curr_remaining_args, has_aux=has_aux
+      )
+
+      # The inputs are saved inside raw_vjp.args_res, and the cached 
+      # activations are saved inside raw_vjp.opaque_residuals. Filter 
+      # raw_vjp.args_res to only store the inputs that will not be explicitly 
+      # provided by the caller.
+      raw_vjp.args_res = [
+        res if not caller_saved else NotNeeded() 
+        for res, caller_saved in zip(raw_vjp.args_res, caller_saved_among_argnums)
+      ]
+      return out_primals, raw_vjp, *rest
+
+    def bwd(f_vjp, *outgrad_and_saved):
+      assert len(outgrad_and_saved) == sum(caller_saved_among_argnums) + 1
+
+      outgrad = outgrad_and_saved[0]
+      caller_saved_vals = outgrad_and_saved[1:]
+
+      # Reconstruct the full args_res by inserting caller saved values.
+      full_args_res = []
+      j = 0
+      for i, caller_saved in enumerate(caller_saved_among_argnums):
+        if caller_saved:
+          full_args_res.append(caller_saved_vals[j])
+          j += 1
+        else:
+          full_args_res.append(f_vjp.args_res[i])
+
+      full_vjp = VJP(fun, f_vjp.in_tree, f_vjp.out_tree, full_args_res, 
+                     f_vjp.opaque_residuals)
+
+      return full_vjp(outgrad)
+
+    if jitted:
+      fwd = jax.jit(fwd)
+      bwd = jax.jit(bwd)
+    return fwd, bwd
 
 
 def vjp_unpack(f_vjp):
-  assert isinstance(f_vjp, Partial)
-  flat_data, tree = jax.tree.flatten(f_vjp)
-  # NB: Don't use None as the dummy value!
-  dataless_vjp = jax.tree.unflatten(tree, [123] * len(flat_data))
-  return (flat_data, dataless_vjp)
+  # assert isinstance(f_vjp, VJP)  
+  # data = (f_vjp.args_res, f_vjp.opaque_residuals)
+  # metadata = (f_vjp.fun, f_vjp.in_tree, f_vjp.out_tree)
+  # return (data, metadata)
+  return f_vjp
 
 def vjp_pack(f_vjp_unpacked):
-  assert isinstance(f_vjp_unpacked, tuple)
-  flat_data, dataless_vjp = f_vjp_unpacked
-  dummy_flat_data, tree = jax.tree.flatten(dataless_vjp)
-  assert len(dummy_flat_data) == len(flat_data)
-  f_vjp = jax.tree.unflatten(tree, flat_data)
-  return f_vjp
+  return f_vjp_unpacked
+  # assert isinstance(f_vjp_unpacked, tuple)
+  # assert len(f_vjp_unpacked) == 2
+
+  # data, metadata = f_vjp_unpacked
+  # args_res, opaque_residuals = data
+  # fun, in_tree, out_tree = metadata
+  
+  # return VJP(fun, in_tree, out_tree, args_res, opaque_residuals)
 
 def with_vjp_unpack(fwd):
   @wraps(fwd)

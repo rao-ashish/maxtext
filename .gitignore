@@ -1,3 +1,6 @@
+# Train outputs.
+train_output/
+
 *__pycache__*
 tmp/
 logs/
