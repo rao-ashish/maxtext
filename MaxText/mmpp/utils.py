@@ -6,6 +6,7 @@ from functools import wraps
 from typing import Callable, Sequence
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 # vjp-related utils imports
@@ -52,58 +53,67 @@ def fwd_and_bwd(
     has_aux: bool = False,
     jitted: bool = True,
 ) -> tuple[Callable, Callable]:
+    # Constructs a partially evaluated version of fun that only takes in the
+    # arguments at argnums as input. 
+    # 
+    # Returns:
+    #   f_partial: The partially evaluated function as an lu.WrappedFun.
+    #   dyn_args: The remaining arguments to pass into f_partial to fully 
+    #     evaluate it. This is a subset of *args.
+    #   bound_args: The elements of *args captured inside f_partial.
+    def make_f_partial(*args, **kwargs):
+      dbg = debug_info('fwd_and_bwd', fun, args, kwargs)
+      f = lu.wrap_init(fun, params=kwargs, debug_info=dbg)
+      f_partial, dyn_args = argnums_partial(
+          f, argnums, args, require_static_args_hashable=False)
+      return f_partial, dyn_args
+
+    def argnum_is_caller_saved(argnum):
+        return (
+          argnum in argnums and 
+          caller_saved_among_argnums[argnums.index(argnum)]
+        )
+
     def fwd(*args, **kwargs):
-      # f_partial is a partially evaluated version of fun that only takes in
-      # the arguments at argnums as input.
-      def f_partial(*remaining_args):
-        assert len(remaining_args) == len(argnums)
-        new_args = []
-        j = 0
-        for i in range(len(args)):
-          if i in argnums:
-            new_args.append(remaining_args[j])
-            j += 1
-          else:
-            new_args.append(args[i])
+      # bwd needs enough metadata to construct the vjp of f_partial. We just
+      # need to save the args that are not user provided and the kwargs.
+      return {
+        "vjp_metadata": {
+          "saved_args": [
+            args[i] for i in range(len(args)) if not argnum_is_caller_saved(i)
+          ],
+          "kwargs": kwargs,
+        },
+        "fun_out": fun(*args, **kwargs)
+      }
 
-        return fun(*new_args)
-      
-      # Compute the VJP of f_partial.
-      curr_remaining_args = [args[argnum] for argnum in argnums]
-      out_primals, raw_vjp, *rest = jax._src.api.vjp3(
-        f_partial, *curr_remaining_args, has_aux=has_aux
-      )
-
-      # The inputs are saved inside raw_vjp.args_res, and the cached 
-      # activations are saved inside raw_vjp.opaque_residuals. Filter 
-      # raw_vjp.args_res to only store the inputs that will not be explicitly 
-      # provided by the caller.
-      raw_vjp.args_res = [
-        res if not caller_saved else NotNeeded() 
-        for res, caller_saved in zip(raw_vjp.args_res, caller_saved_among_argnums)
-      ]
-      return out_primals, raw_vjp, *rest
-
-    def bwd(f_vjp, *outgrad_and_saved):
+    def bwd(vjp_metadata, *outgrad_and_saved):
       assert len(outgrad_and_saved) == sum(caller_saved_among_argnums) + 1
 
       outgrad = outgrad_and_saved[0]
       caller_saved_vals = outgrad_and_saved[1:]
 
-      # Reconstruct the full args_res by inserting caller saved values.
-      full_args_res = []
-      j = 0
-      for i, caller_saved in enumerate(caller_saved_among_argnums):
-        if caller_saved:
-          full_args_res.append(caller_saved_vals[j])
-          j += 1
+      # Reconstruct the full args list used to create f_partial.
+      args = vjp_metadata["args"]
+      args = []
+      num_args = len(vjp_metadata["saved_args"]) + sum(caller_saved_among_argnums)
+
+      curr_caller_saved_idx = 0
+      curr_saved_idx = 0
+
+      for i in range(num_args):
+        if argnum_is_caller_saved(i):
+          args.append(caller_saved_vals[curr_caller_saved_idx])
+          curr_caller_saved_idx += 1
         else:
-          full_args_res.append(f_vjp.args_res[i])
+          args.append(vjp_metadata["saved_args"][curr_caller_saved_idx])
+          curr_saved_idx += 1
 
-      full_vjp = VJP(fun, f_vjp.in_tree, f_vjp.out_tree, full_args_res, 
-                     f_vjp.opaque_residuals)
+      # Construct f_partial, and take its vjp.
+      f_partial, dyn_args = make_f_partial(*args, **vjp_metadata["kwargs"])
+      _, vjp_fn, _ = jax._src.api._vjp3(f_partial, *dyn_args, has_aux=has_aux)
 
-      return full_vjp(outgrad)
+      return vjp_fn(outgrad)
 
     if jitted:
       fwd = jax.jit(fwd)
@@ -112,13 +122,27 @@ def fwd_and_bwd(
 
 
 def vjp_unpack(f_vjp):
-  # assert isinstance(f_vjp, VJP)  
+  # assert isinstance(f_vjp, VJP)
   # data = (f_vjp.args_res, f_vjp.opaque_residuals)
-  # metadata = (f_vjp.fun, f_vjp.in_tree, f_vjp.out_tree)
-  # return (data, metadata)
+  # # metadata = (f_vjp.fun, f_vjp.in_tree, f_vjp.out_tree)
+  
+  # dummy_data = jax.tree.map(lambda x: 123 * jnp.ones_like(x), data)
+  # dummy_vjp = VJP(f_vjp.fun, f_vjp.in_tree, f_vjp.out_tree, dummy_data[0], 
+  #                 dummy_data[1])
+
+  # return (data, dummy_vjp)
   return f_vjp
 
 def vjp_pack(f_vjp_unpacked):
+
+  # assert isinstance(f_vjp_unpacked, tuple)
+
+  # data, dummy_vjp = f_vjp_unpacked
+
+  # return VJP(
+  #   dummy_vjp.fun, dummy_vjp.in_tree, dummy_vjp.out_tree, data[0], data[1]
+  # )
+
   return f_vjp_unpacked
   # assert isinstance(f_vjp_unpacked, tuple)
   # assert len(f_vjp_unpacked) == 2
@@ -130,20 +154,22 @@ def vjp_pack(f_vjp_unpacked):
   # return VJP(fun, in_tree, out_tree, args_res, opaque_residuals)
 
 def with_vjp_unpack(fwd):
-  @wraps(fwd)
-  def wrapper(*args, **kwargs):
-    out = fwd(*args, **kwargs)
-    assert 2 <= len(out) <= 3
-    return tuple_update(out, 1, vjp_unpack(out[1]))
-  return wrapper
+  return fwd
+  # @wraps(fwd)
+  # def wrapper(*args, **kwargs):
+  #   out = fwd(*args, **kwargs)
+  #   assert 2 <= len(out) <= 3
+  #   return tuple_update(out, 1, vjp_unpack(out[1]))
+  # return wrapper
 
 def with_vjp_pack(bwd):
-  @wraps(bwd)
-  def wrapper(*args, **kwargs):
-    assert len(args) == 3
-    args = tuple_update(args, 0, vjp_pack(args[0]))
-    return bwd(*args, **kwargs)
-  return wrapper
+  return bwd
+  # @wraps(bwd)
+  # def wrapper(*args, **kwargs):
+  #   assert len(args) == 3
+  #   args = tuple_update(args, 0, vjp_pack(args[0]))
+  #   return bwd(*args, **kwargs)
+  # return wrapper
 
 
 ### Various debugging utilities

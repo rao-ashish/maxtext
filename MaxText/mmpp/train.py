@@ -103,7 +103,7 @@ def fwd_stage(fwd, params, input_activations, data, rng, mubatch_idx):
   # Slice out the microbatch
   mubatch_data = jax.tree.map(lambda x: x[mubatch_idx], data)
   res = fwd(params, input_activations, mubatch_data, rng)
-  return params, *res
+  return res["vjp_metadata"], params, *res["fun_out"]
 
 
 def bwd_stage(bwd, params, stashed, out_cot, grads_acc):
@@ -355,7 +355,7 @@ def value_and_grad(
             dropout_rngs[stage_idx],
             mubatch_idx_consts_by_stage[stage_idx][mubatch_idx],
         )
-        params_by_stage[stage_idx], activation, stashed[curr_id] = res[:3]
+        stashed[curr_id], params_by_stage[stage_idx], activation = res[:3]
         if stage_idx == num_stages - 1:
           loss[mubatch_idx] = activation
           aux[mubatch_idx] = res[3]

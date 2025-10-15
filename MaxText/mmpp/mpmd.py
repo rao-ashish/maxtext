@@ -32,8 +32,12 @@ def sharding_with_mesh(s, mesh):
   return NamedSharding(mesh, s.spec, memory_kind=s.memory_kind)
 
 
-def adjust_to_stage_mesh(stage_mesh, shardings):
-  return jax.tree.map(partial(sharding_with_mesh, mesh=stage_mesh), shardings)
+def adjust_to_stage_mesh(stage_mesh, shardings, force_pytree_def=None):
+  out = jax.tree.map(partial(sharding_with_mesh, mesh=stage_mesh), shardings)
+  if force_pytree_def is not None:
+    out = jax.tree.unflatten(force_pytree_def, 
+      jax.tree.flatten(out, is_leaf=is_jax_partial)[0])
+  return out
 
 
 SectionKind = Enum('SectionKind', 'Prologue Forward Backward BackwardLast Epilogue')
@@ -280,23 +284,52 @@ def transform(
   ):
     section_kind, stage_index = section_name
     stage_mesh = get_stage_mesh(mesh, stage_index)
-    in_shardings = adjust_to_stage_mesh(stage_mesh, section_in_shardings[section_name])
-    out_shardings = adjust_to_stage_mesh(stage_mesh, section_out_shardings[section_name])
-    section_fn.__name__ = f"section_{section_kind.name}{stage_index}"
-    jitted_section_fn = jax.jit(
-        section_fn,
-        in_shardings=in_shardings,
-        out_shardings=out_shardings,
-        static_argnums=static_argnums,
-        donate_argnums=donate_argnums,
-    )
-    @wraps(jitted_section_fn)
+
     def apply_stage(*args):
       check_args_mesh(section_name, stage_mesh, args)
       with stage_mesh:
-        if section_name not in compiled_section_fns:
-          compiled_section_fns[section_name] = jitted_section_fn.lower(*args).compile()
+        if section_name in compiled_section_fns:
+          return compiled_section_fns[section_name](*args)
+
+        _, args_treedef = jax.tree.flatten(args, is_leaf=is_jax_partial)
+
+        in_shardings = adjust_to_stage_mesh(
+          stage_mesh, section_in_shardings[section_name], 
+          force_pytree_def=args_treedef,
+        )
+        out_shardings = adjust_to_stage_mesh(
+          stage_mesh, section_out_shardings[section_name], 
+          # force_pytree_def=args_treedef,
+        )
+
+        section_fn.__name__ = f"section_{section_kind.name}{stage_index}"
+        compiled_section_fns[section_name] = jax.jit(
+            section_fn,
+            in_shardings=in_shardings,
+            out_shardings=out_shardings,
+            static_argnums=static_argnums,
+            donate_argnums=donate_argnums,
+        ).lower(*args).compile()
+        
         return compiled_section_fns[section_name](*args)
+
+    # in_shardings = adjust_to_stage_mesh(stage_mesh, section_in_shardings[section_name])
+    # out_shardings = adjust_to_stage_mesh(stage_mesh, section_out_shardings[section_name])
+    # section_fn.__name__ = f"section_{section_kind.name}{stage_index}"
+    # jitted_section_fn = jax.jit(
+    #     section_fn,
+    #     in_shardings=in_shardings,
+    #     out_shardings=out_shardings,
+    #     static_argnums=static_argnums,
+    #     donate_argnums=donate_argnums,
+    # )
+    # @wraps(jitted_section_fn)
+    # def apply_stage(*args):
+    #   check_args_mesh(section_name, stage_mesh, args)
+    #   with stage_mesh:
+    #     if section_name not in compiled_section_fns:
+    #       compiled_section_fns[section_name] = jitted_section_fn.lower(*args).compile()
+    #     return compiled_section_fns[section_name](*args)
     return apply_stage
 
   ctx = Context(
