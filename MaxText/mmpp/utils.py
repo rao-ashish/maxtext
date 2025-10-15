@@ -77,15 +77,17 @@ def fwd_and_bwd(
     def fwd(*args, **kwargs):
       # bwd needs enough metadata to construct the vjp of f_partial. We just
       # need to save the args that are not user provided and the kwargs.
-      return {
-        "vjp_metadata": {
+      vjp_metadata = {
           "saved_args": [
             args[i] for i in range(len(args)) if not argnum_is_caller_saved(i)
           ],
+          "all_args": args,
           "kwargs": kwargs,
-        },
-        "fun_out": fun(*args, **kwargs)
-      }
+        }
+
+      if has_aux:
+        return vjp_metadata, *fun(*args, **kwargs)
+      return vjp_metadata, fun(*args, **kwargs)
 
     def bwd(vjp_metadata, *outgrad_and_saved):
       assert len(outgrad_and_saved) == sum(caller_saved_among_argnums) + 1
@@ -94,24 +96,28 @@ def fwd_and_bwd(
       caller_saved_vals = outgrad_and_saved[1:]
 
       # Reconstruct the full args list used to create f_partial.
-      args = vjp_metadata["args"]
-      args = []
-      num_args = len(vjp_metadata["saved_args"]) + sum(caller_saved_among_argnums)
+      args = vjp_metadata["all_args"]
+      # args = []
+      # num_args = len(vjp_metadata["saved_args"]) + sum(caller_saved_among_argnums)
 
-      curr_caller_saved_idx = 0
-      curr_saved_idx = 0
+      # curr_caller_saved_idx = 0
+      # curr_saved_idx = 0
 
-      for i in range(num_args):
-        if argnum_is_caller_saved(i):
-          args.append(caller_saved_vals[curr_caller_saved_idx])
-          curr_caller_saved_idx += 1
-        else:
-          args.append(vjp_metadata["saved_args"][curr_caller_saved_idx])
-          curr_saved_idx += 1
+      # for i in range(num_args):
+      #   if argnum_is_caller_saved(i):
+      #     args.append(caller_saved_vals[curr_caller_saved_idx])
+      #     curr_caller_saved_idx += 1
+      #   else:
+      #     args.append(vjp_metadata["saved_args"][curr_caller_saved_idx])
+      #     curr_saved_idx += 1
 
       # Construct f_partial, and take its vjp.
       f_partial, dyn_args = make_f_partial(*args, **vjp_metadata["kwargs"])
-      _, vjp_fn, _ = jax._src.api._vjp3(f_partial, *dyn_args, has_aux=has_aux)
+
+      if has_aux:
+        _, vjp_fn, _ = jax._src.api._vjp3(f_partial, *dyn_args, has_aux=has_aux)
+      else:
+        _, vjp_fn = jax._src.api._vjp3(f_partial, *dyn_args, has_aux=has_aux)
 
       return vjp_fn(outgrad)
 
