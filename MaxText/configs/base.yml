@@ -171,8 +171,8 @@ inhomogeneous_layer_cycle_interval: 1
 # perform the circular transfer (last stage to first) asynchronously.
 # The bubble fraction is (num_stages - 1) / (num_pipeline_repeats * num_pipeline_microbatches + num_stages - 1)
 # num_layers_per_pipeline_stage: 1
-# num_layers_per_pipeline_stage: 2
-num_layers_per_pipeline_stage: 4
+num_layers_per_pipeline_stage: 2
+# num_layers_per_pipeline_stage: 4
 # num_layers_per_pipeline_stage: 8
 # The number of repeats will be set to num_decoder_layers / (num_pipeline_stages * num_layers_per_pipeline_stage)
 num_pipeline_repeats: -1

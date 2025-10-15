@@ -73,51 +73,59 @@ def fwd_and_bwd(
           argnum in argnums and 
           caller_saved_among_argnums[argnums.index(argnum)]
         )
+      
+    inner_vjp_fn = None
 
     def fwd(*args, **kwargs):
-      # bwd needs enough metadata to construct the vjp of f_partial. We just
-      # need to save the args that are not user provided and the kwargs.
-      vjp_metadata = {
-          "saved_args": [
-            args[i] for i in range(len(args)) if not argnum_is_caller_saved(i)
-          ],
-          "all_args": args,
-          "kwargs": kwargs,
-        }
+      nonlocal inner_vjp_fn
 
-      if has_aux:
-        return vjp_metadata, *fun(*args, **kwargs)
-      return vjp_metadata, fun(*args, **kwargs)
+      # Partially evaluate f to only take in the arguments at argnums.
+      # dyn_args is the subset of args corresponding to argnums.
+      f_partial, dyn_args = make_f_partial(*args, **kwargs)
 
-    def bwd(vjp_metadata, *outgrad_and_saved):
+      # Take the vjp.
+      primals_out, vjp_fn, *rest = jax._src.api._vjp3(
+          f_partial, *dyn_args, has_aux=has_aux
+      )
+
+      # vjp_fn.args_res contains the saved arguments. vjp_fn.opaque_residuals
+      # contains saved activations for the backward pass.
+      #
+      # For args which have caller_saved_among_argnums = True, we do not need
+      # to save those inside args_res, because the caller will provide them
+      # again when bwd is called. So, remove them.
+      vjp_fn.args_res = [
+          res if not caller_saved_among_argnums[idx] else NotNeeded()
+          for idx, res in enumerate(vjp_fn.args_res)
+      ]
+
+      # Save vjp_fn.fun 'out of band' from bwd's args. Then, remove it from 
+      # vjp_fn.
+      inner_vjp_fn = vjp_fn.fun
+      vjp_fn.fun = 123
+
+      return vjp_fn, primals_out, *rest
+
+    def bwd(vjp_fn, *outgrad_and_saved):
       assert len(outgrad_and_saved) == sum(caller_saved_among_argnums) + 1
 
       outgrad = outgrad_and_saved[0]
       caller_saved_vals = outgrad_and_saved[1:]
 
+      # Reset vjp_fn.fun.
+      assert inner_vjp_fn != 123, "inner_vjp_fn was not properly captured."
+      vjp_fn.fun = inner_vjp_fn
+
       # Reconstruct the full args list used to create f_partial.
-      args = vjp_metadata["all_args"]
-      # args = []
-      # num_args = len(vjp_metadata["saved_args"]) + sum(caller_saved_among_argnums)
-
-      # curr_caller_saved_idx = 0
-      # curr_saved_idx = 0
-
-      # for i in range(num_args):
-      #   if argnum_is_caller_saved(i):
-      #     args.append(caller_saved_vals[curr_caller_saved_idx])
-      #     curr_caller_saved_idx += 1
-      #   else:
-      #     args.append(vjp_metadata["saved_args"][curr_caller_saved_idx])
-      #     curr_saved_idx += 1
-
-      # Construct f_partial, and take its vjp.
-      f_partial, dyn_args = make_f_partial(*args, **vjp_metadata["kwargs"])
-
-      if has_aux:
-        _, vjp_fn, _ = jax._src.api._vjp3(f_partial, *dyn_args, has_aux=has_aux)
-      else:
-        _, vjp_fn = jax._src.api._vjp3(f_partial, *dyn_args, has_aux=has_aux)
+      new_args_res = []
+      curr_caller_saved_idx = 0
+      for idx, arg_res in enumerate(vjp_fn.args_res):
+        if caller_saved_among_argnums[idx]:
+          new_args_res.append(caller_saved_vals[curr_caller_saved_idx])
+          curr_caller_saved_idx += 1
+        else:
+          new_args_res.append(arg_res)
+      vjp_fn.args_res = new_args_res
 
       return vjp_fn(outgrad)
 
