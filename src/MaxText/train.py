@@ -42,6 +42,8 @@ from cloud_tpu_diagnostics.configuration import debug_configuration
 from cloud_tpu_diagnostics.configuration import diagnostic_configuration
 from cloud_tpu_diagnostics.configuration import stack_trace_configuration
 
+from MaxText import mmpp
+
 from MaxText import checkpointing
 from MaxText import exceptions
 from MaxText import max_logging
@@ -403,18 +405,24 @@ def train_loop(config, recorder, state=None):
 
   params_shardings, state_mesh_shardings = maxtext_utils.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
 
-  p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(
-      config, model, mesh, state, state_mesh_shardings, train_step, eval_step, eval_data_iterator, params_shardings
+  _train_step = mmpp.train_step if config.use_mmpp else train_step
+  state, init_rng, p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(
+      config, init_rng, next(data_iterator), model, mesh, state, state_mesh_shardings, _train_step, eval_step, eval_data_iterator, params_shardings
   )
 
-  with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-    shaped_batch = maxtext_utils.get_shaped_batch(config)
-    state = jax.lax.with_sharding_constraint(state, state_mesh_shardings)
-    compiled = p_train_step.lower(state, shaped_batch, init_rng).compile()
-    compiled_stats = compiled.memory_analysis()
-    max_utils.print_compiled_memory_stats(compiled_stats)
+  if not config.use_mmpp:
+    with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+      shaped_batch = maxtext_utils.get_shaped_batch(config)
+      state = jax.lax.with_sharding_constraint(state, state_mesh_shardings)
+      compiled = p_train_step.lower(state, shaped_batch, init_rng).compile()
+      compiled_stats = compiled.memory_analysis()
+      max_utils.print_compiled_memory_stats(compiled_stats)
 
-  start_step = get_first_step(state)  # this is the start_step for training
+  if config.use_mmpp:
+    start_step = 0
+  else:
+    start_step = get_first_step(state)  # this is the start_step for training
+
   prof = profiler.Profiler(config, offset_step=start_step)
   data_loader = DataLoader(config, mesh, data_iterator, recorder)
   metric_logger = MetricLogger(config=config, learning_rate_schedule=learning_rate_schedule)

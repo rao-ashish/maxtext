@@ -32,6 +32,9 @@ from functools import partial
 from etils import epath
 
 
+from MaxText import mmpp
+
+
 @overload
 def from_config(
     config: pyconfig.HyperParameters,
@@ -85,6 +88,9 @@ def from_config(
 
 def get_transformer_model(config, mesh, quant, model_mode: str = MODEL_MODE_TRAIN, rngs: nnx.Rngs | None = None):
   """Returns the transformer model based on the configuration."""
+  if config.use_mmpp:
+    assert model_mode == MODEL_MODE_TRAIN, "mmpp is only supported for training."
+    return mmpp.Transformer(config, mesh, quant)
   if config.model_fsdp_ag_once:
     if rngs is not None:
       raise NotImplementedError
