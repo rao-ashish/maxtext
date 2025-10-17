@@ -15,6 +15,8 @@ import jax.numpy as jnp
 from jax.debug import inspect_array_sharding
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 
+from flax.linen import partitioning as nn_partitioning
+
 
 def slice_mesh(mesh, axis_name, slice_index):
   axis = mesh.axis_names.index(axis_name)
@@ -217,7 +219,7 @@ def check_args_mesh(name, stage_mesh, args):
 
 
 def transform(
-    mesh, section_fns, step_fn, step_in_shardings, step_out_shardings, example_inputs,
+    mesh, section_fns, step_fn, step_in_shardings, step_out_shardings, state, example_batch, init_rng, axis_rules,
     print_inferred_shardings=False,
 ):
   # Phase 1: Infer shardings
@@ -232,12 +234,36 @@ def transform(
       dump_shardings(section_fn)
     return wrapped
 
+  def remove_stage_from_spec(spec):
+    """Remove 'stage' axis from a PartitionSpec."""
+    new_spec_parts = []
+    for part in spec:
+        if part is None:
+            new_spec_parts.append(None)
+        elif isinstance(part, str):
+            if part != 'stage':
+                new_spec_parts.append(part)
+        elif isinstance(part, (tuple, list)):
+            filtered = tuple(p for p in part if p != 'stage')
+            if filtered:  # Only append if not empty
+                new_spec_parts.append(filtered)
+    return P(*new_spec_parts)
+
   def make_shape_dtype(arr):
-    return jax.ShapeDtypeStruct(
-        arr.shape,
-        arr.dtype,
-        sharding=sharding_with_mesh(arr.sharding, stage0_mesh),
-    )
+    if isinstance(arr, jax.Array) and isinstance(arr.sharding, NamedSharding):
+        new_spec = remove_stage_from_spec(arr.sharding.spec)
+        return jax.ShapeDtypeStruct(
+            arr.shape,
+            arr.dtype,
+            sharding=NamedSharding(stage0_mesh, new_spec, memory_kind=arr.sharding.memory_kind),
+        )
+    return arr
+
+  def reshard_to_stage0(x):
+    if isinstance(x, jax.Array) and isinstance(x.sharding, NamedSharding):
+        new_spec = remove_stage_from_spec(x.sharding.spec)
+        return jax.device_put(x, NamedSharding(stage0_mesh, new_spec))
+    return x
 
   ctx = Context(
     mesh=mesh,
@@ -246,29 +272,37 @@ def transform(
     section_decorator=dump_section_shardings,
   )
   stage0_mesh = ctx.get_stage_mesh(0)
-  with set_context(ctx), stage0_mesh:
+  with set_context(ctx), stage0_mesh, nn_partitioning.axis_rules(axis_rules):
+    # print("example_batch shape:")
+    # print(jax.tree.map(lambda x: x.shape if isinstance(x, jax.Array) else None, example_batch))
+    # print()
 
-    print("Example inputs[1] shape:")
-    print(jax.tree.map(lambda x: x.shape if isinstance(x, jax.Array) else None, example_inputs[1]))
+    # print("step_in_shardings[1]:")
+    # print(step_in_shardings[1])
+    # print()
 
-    print("step_in_shardings[1]:")
-    print(step_in_shardings[1])
+    # print("example_batch['inputs'].sharding:")
+    # print(example_batch['inputs'].sharding)
+    # print()
 
     # print("arg_shape_dtypes:")
-    # for arg_shape_dtype in jax.tree.map(make_shape_dtype, example_inputs):
-    #   print(arg_shape_dtype)
+    # for k, v in jax.tree.map(make_shape_dtype, example_batch).items():
+    #   print(k, v)
+    # print()
 
-    # jax.jit(
-    #     step_fn,
-    #     in_shardings=adjust_to_stage_mesh(stage0_mesh, step_in_shardings),
-    #     out_shardings=adjust_to_stage_mesh(stage0_mesh, step_out_shardings),
-    # ).lower(*jax.tree.map(make_shape_dtype, example_inputs)).compile()
+    # print(f"init_rng type: {init_rng}")
+    # print()
 
-    jax.jit(
+    # print(f"train state types:")
+    # jax.tree.map(lambda x: print(type(x)), state)
+
+    # Just lower to capture shardings via the dump_shardings callbacks
+    # We don't need to compile - lowering is enough to trigger the callbacks
+    _ = jax.jit(
         step_fn,
         in_shardings=adjust_to_stage_mesh(stage0_mesh, step_in_shardings),
         out_shardings=adjust_to_stage_mesh(stage0_mesh, step_out_shardings),
-    ).lower(*example_inputs).compile()
+    ).lower(*jax.tree.map(make_shape_dtype, (state, example_batch, init_rng)))
 
   assert all(
     section_name in in_shardings_thunk and section_name in out_shardings_thunk
@@ -320,13 +354,29 @@ def transform(
         )
 
         section_fn.__name__ = f"section_{section_kind.name}{stage_index}"
+        # compiled_section_fns[section_name] = jax.jit(
+        #     section_fn,
+        #     in_shardings=in_shardings,
+        #     out_shardings=out_shardings,
+        #     static_argnums=static_argnums,
+        #     donate_argnums=donate_argnums,
+        # ).lower(*args).compile()
+
         compiled_section_fns[section_name] = jax.jit(
-            section_fn,
-            in_shardings=in_shardings,
-            out_shardings=out_shardings,
-            static_argnums=static_argnums,
-            donate_argnums=donate_argnums,
-        ).lower(*args).compile()
+          section_fn,
+          in_shardings=in_shardings,
+          out_shardings=out_shardings,
+          static_argnums=static_argnums,
+          donate_argnums=donate_argnums,
+        )
+
+        with open("jaxpr_dump.txt", "w+") as f:
+          jaxpr = str(jax.make_jaxpr(compiled_section_fns[section_name])(*args))
+          f.write(jaxpr)
+        
+        with open("hlo_dump.txt", "w+") as f:
+          unoptimized_stable_hlo = compiled_section_fns[section_name].lower(*args).as_text()
+          f.write(unoptimized_stable_hlo)
         
         return compiled_section_fns[section_name](*args)
 

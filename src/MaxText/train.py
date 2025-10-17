@@ -397,6 +397,9 @@ def train_loop(config, recorder, state=None):
       state,
   ) = train_utils.setup_train_loop(config, recorder)
 
+  data_loader = DataLoader(config, mesh, data_iterator, recorder)
+  metric_logger = MetricLogger(config=config, learning_rate_schedule=learning_rate_schedule)
+
   if config.use_dpo:
     if "reference_params" not in state.params:
       reference_params = jax.tree.map(jnp.copy, state.params["params"])
@@ -407,7 +410,7 @@ def train_loop(config, recorder, state=None):
 
   _train_step = mmpp.train_step if config.use_mmpp else train_step
   state, init_rng, p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(
-      config, init_rng, next(data_iterator), model, mesh, state, state_mesh_shardings, _train_step, eval_step, eval_data_iterator, params_shardings
+      config, init_rng, data_loader, model, mesh, state, state_mesh_shardings, _train_step, eval_step, eval_data_iterator, params_shardings
   )
 
   if not config.use_mmpp:
@@ -422,13 +425,10 @@ def train_loop(config, recorder, state=None):
     start_step = 0
   else:
     start_step = get_first_step(state)  # this is the start_step for training
-
   prof = profiler.Profiler(config, offset_step=start_step)
-  data_loader = DataLoader(config, mesh, data_iterator, recorder)
-  metric_logger = MetricLogger(config=config, learning_rate_schedule=learning_rate_schedule)
 
   # Write train config params, num model params, and XLA flags to tensorboard
-  metric_logger.write_setup_info_to_tensorboard(state.params)
+  # metric_logger.write_setup_info_to_tensorboard(state.params)
 
   try:
     last_step_completion = datetime.datetime.now()
@@ -441,7 +441,8 @@ def train_loop(config, recorder, state=None):
         nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
         with maybe_record_goodput(recorder, GoodputEvent.STEP, step):
           with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-            state = jax.lax.with_sharding_constraint(state, state_mesh_shardings)
+            if not config.use_mmpp:
+              state = jax.lax.with_sharding_constraint(state, state_mesh_shardings)
             state, metrics = p_train_step(state, example_batch, nextrng)
 
       step_time_delta = datetime.datetime.now() - last_step_completion

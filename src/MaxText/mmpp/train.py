@@ -457,7 +457,7 @@ def prepare_state_and_train_step(
     functional_train,
     in_shard_train,
     out_shard_train,
-    example_data,
+    example_batch,
 ):
   state, in_shard_train, out_shard_train = split_and_transfer_state(
       mesh,
@@ -470,14 +470,31 @@ def prepare_state_and_train_step(
   # Replicate init_rng
   init_rng = jax.device_put(init_rng, device=NamedSharding(mesh, PartitionSpec()))
 
-  with mesh, nn_partitioning.axis_rules(model.config.logical_axis_rules):
-    p_train_step = mpmd.transform(
-        mesh,
-        get_section_fns(model, state),
-        functional_train,
-        in_shard_train,
-        out_shard_train,
-        (state, example_data, init_rng),
-    )
+  # with mesh, nn_partitioning.axis_rules(model.config.logical_axis_rules):
+  #   p_train_step = mpmd.transform(
+  #       mesh,
+  #       get_section_fns(model, state),
+  #       functional_train,
+  #       in_shard_train,
+  #       out_shard_train,
+  #       state,
+  #       dataloader,
+  #       init_rng,
+  #       # (state, example_data, init_rng),
+  #   )
+
+  p_train_step = mpmd.transform(
+      mesh,
+      get_section_fns(model, state),
+      functional_train,
+      in_shard_train,
+      out_shard_train,
+      state,
+      example_batch,
+      init_rng,
+      model.config.logical_axis_rules
+      # (state, example_data, init_rng),
+  )
+
 
   return state, init_rng, p_train_step

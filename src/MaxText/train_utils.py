@@ -30,6 +30,8 @@ from MaxText import model_creation_utils
 
 from MaxText import mmpp
 
+from flax.linen import partitioning as nn_partitioning
+
 
 def create_training_tools(config, model, mesh):
   """Creates the init_rng, optimizer, learning rate schedule, and checkpoint manager."""
@@ -136,7 +138,7 @@ def jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step)
 def jit_train_and_eval_step(
     config,
     init_rng,
-    example_batch,
+    dataloader,
     model,
     mesh,
     state,
@@ -159,6 +161,9 @@ def jit_train_and_eval_step(
     ) = maxtext_utils.get_functional_train_with_signature(
         train_step, data_sharding, state_mesh_shardings, model, config, params_shardings
     )
+
+    with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+      example_batch = dataloader.load_next_batch()
 
     state, init_rng, p_train_step = mmpp.prepare_state_and_train_step(
           mesh,
