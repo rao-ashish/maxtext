@@ -18,33 +18,15 @@ from jax._src.api import NotNeeded
 
 # Profiling imports
 from ctypes import cdll
-libcudart = cdll.LoadLibrary('libcudart.so')
+
+libcudart = cdll.LoadLibrary("libcudart.so")
 import nvtx
 
 
+DUMMY_VJP_FUN = 123
+
+
 ### vjp-related utilities
-
-# def fwd_and_bwd(
-#     fun: Callable, argnums: Sequence[int], caller_saved_among_argnums: Sequence[bool],
-#     has_aux: bool = False, jitted: bool = True,
-# ) -> tuple[Callable, Callable]:
-#   def fwd(*args, **kwargs):
-#     dbg = debug_info('fwd_and_bwd', fun, args, kwargs)
-#     f = lu.wrap_init(fun, params=kwargs, debug_info=dbg)
-#     f_partial, dyn_args = argnums_partial(
-#         f, argnums, args, require_static_args_hashable=False)
-#     # return jax._src.api._saved_input_vjp(
-#     #     f_partial, caller_saved_among_argnums, *dyn_args, has_aux=has_aux)
-#     return jax._src.api.saved_input_vjp(
-#         f_partial, caller_saved_among_argnums, *dyn_args)
-#   def bwd(f_vjp, *outgrad_and_saved):
-#     assert len(outgrad_and_saved) == sum(caller_saved_among_argnums) + 1
-#     return f_vjp(*outgrad_and_saved)
-#   if jitted:
-#     fwd = jax.jit(fwd)
-#     bwd = jax.jit(bwd)
-#   return fwd, bwd
-
 
 def fwd_and_bwd(
     fun: Callable,
@@ -53,137 +35,68 @@ def fwd_and_bwd(
     has_aux: bool = False,
     jitted: bool = True,
 ) -> tuple[Callable, Callable]:
-    # Constructs a partially evaluated version of fun that only takes in the
-    # arguments at argnums as input. 
-    # 
-    # Returns:
-    #   f_partial: The partially evaluated function as an lu.WrappedFun.
-    #   dyn_args: The remaining arguments to pass into f_partial to fully 
-    #     evaluate it. This is a subset of *args.
-    #   bound_args: The elements of *args captured inside f_partial.
-    def make_f_partial(*args, **kwargs):
-      dbg = debug_info('fwd_and_bwd', fun, args, kwargs)
-      f = lu.wrap_init(fun, params=kwargs, debug_info=dbg)
-      f_partial, dyn_args = argnums_partial(
-          f, argnums, args, require_static_args_hashable=False)
-      return f_partial, dyn_args
 
-    def argnum_is_caller_saved(argnum):
-        return (
-          argnum in argnums and 
-          caller_saved_among_argnums[argnums.index(argnum)]
-        )
-      
-    inner_vjp_fn = None
+  def argnum_is_caller_saved(argnum):
+    return argnum in argnums and caller_saved_among_argnums[argnums.index(argnum)]
 
-    def fwd(*args, **kwargs):
-      nonlocal inner_vjp_fn
+  inner_vjp_fn = None
 
-      # Partially evaluate f to only take in the arguments at argnums.
-      # dyn_args is the subset of args corresponding to argnums.
-      f_partial, dyn_args = make_f_partial(*args, **kwargs)
+  def fwd(*args, **kwargs):
+    nonlocal inner_vjp_fn
 
-      # Take the vjp.
-      primals_out, vjp_fn, *rest = jax._src.api._vjp3(
-          f_partial, *dyn_args, has_aux=has_aux
-      )
+    # Partially evaluate f to only take in the arguments at argnums.
+    # dyn_args is the subset of args corresponding to argnums.
+    dbg = debug_info("fwd_and_bwd", fun, args, kwargs)
+    f = lu.wrap_init(fun, params=kwargs, debug_info=dbg)
+    f_partial, dyn_args = argnums_partial(f, argnums, args, require_static_args_hashable=False)
 
-      # vjp_fn.args_res contains the saved arguments. vjp_fn.opaque_residuals
-      # contains saved activations for the backward pass.
-      #
-      # For args which have caller_saved_among_argnums = True, we do not need
-      # to save those inside args_res, because the caller will provide them
-      # again when bwd is called. So, remove them.
-      vjp_fn.args_res = [
-          res if not caller_saved_among_argnums[idx] else NotNeeded()
-          for idx, res in enumerate(vjp_fn.args_res)
-      ]
+    # Take the vjp.
+    primals_out, vjp_fn, *rest = jax._src.api._vjp3(f_partial, *dyn_args, has_aux=has_aux)
 
-      # Save vjp_fn.fun 'out of band' from bwd's args. Then, remove it from 
-      # vjp_fn.
-      inner_vjp_fn = vjp_fn.fun
-      vjp_fn.fun = 123
+    # vjp_fn.args_res contains the saved arguments. vjp_fn.opaque_residuals
+    # contains saved activations for the backward pass.
+    #
+    # For args which have caller_saved_among_argnums = True, we do not need
+    # to save those inside args_res, because the caller will provide them
+    # again when bwd is called. So, remove them.
+    vjp_fn.args_res = [
+        res if not caller_saved_among_argnums[idx] else NotNeeded() for idx, res in enumerate(vjp_fn.args_res)
+    ]
 
-      return vjp_fn, primals_out, *rest
+    # Save vjp_fn.fun 'out of band' from bwd's args. Then, remove it from
+    # vjp_fn.
+    inner_vjp_fn = vjp_fn.fun
+    vjp_fn.fun = DUMMY_VJP_FUN
 
-    def bwd(vjp_fn, *outgrad_and_saved):
-      assert len(outgrad_and_saved) == sum(caller_saved_among_argnums) + 1
+    return vjp_fn, primals_out, *rest
 
-      outgrad = outgrad_and_saved[0]
-      caller_saved_vals = outgrad_and_saved[1:]
+  def bwd(vjp_fn, *outgrad_and_saved):
+    assert len(outgrad_and_saved) == sum(caller_saved_among_argnums) + 1
 
-      # Reset vjp_fn.fun.
-      assert inner_vjp_fn != 123, "inner_vjp_fn was not properly captured."
-      vjp_fn.fun = inner_vjp_fn
+    outgrad = outgrad_and_saved[0]
+    caller_saved_vals = outgrad_and_saved[1:]
 
-      # Reconstruct the full args list used to create f_partial.
-      new_args_res = []
-      curr_caller_saved_idx = 0
-      for idx, arg_res in enumerate(vjp_fn.args_res):
-        if caller_saved_among_argnums[idx]:
-          new_args_res.append(caller_saved_vals[curr_caller_saved_idx])
-          curr_caller_saved_idx += 1
-        else:
-          new_args_res.append(arg_res)
-      vjp_fn.args_res = new_args_res
+    # Reset vjp_fn.fun.
+    assert inner_vjp_fn != DUMMY_VJP_FUN, "inner_vjp_fn was not properly captured."
+    vjp_fn.fun = inner_vjp_fn
 
-      return vjp_fn(outgrad)
+    # Reconstruct the full args list used to create f_partial.
+    new_args_res = []
+    curr_caller_saved_idx = 0
+    for idx, arg_res in enumerate(vjp_fn.args_res):
+      if caller_saved_among_argnums[idx]:
+        new_args_res.append(caller_saved_vals[curr_caller_saved_idx])
+        curr_caller_saved_idx += 1
+      else:
+        new_args_res.append(arg_res)
+    vjp_fn.args_res = new_args_res
 
-    if jitted:
-      fwd = jax.jit(fwd)
-      bwd = jax.jit(bwd)
-    return fwd, bwd
+    return vjp_fn(outgrad)
 
-
-def vjp_unpack(f_vjp):
-  # assert isinstance(f_vjp, VJP)
-  # data = (f_vjp.args_res, f_vjp.opaque_residuals)
-  # # metadata = (f_vjp.fun, f_vjp.in_tree, f_vjp.out_tree)
-  
-  # dummy_data = jax.tree.map(lambda x: 123 * jnp.ones_like(x), data)
-  # dummy_vjp = VJP(f_vjp.fun, f_vjp.in_tree, f_vjp.out_tree, dummy_data[0], 
-  #                 dummy_data[1])
-
-  # return (data, dummy_vjp)
-  return f_vjp
-
-def vjp_pack(f_vjp_unpacked):
-
-  # assert isinstance(f_vjp_unpacked, tuple)
-
-  # data, dummy_vjp = f_vjp_unpacked
-
-  # return VJP(
-  #   dummy_vjp.fun, dummy_vjp.in_tree, dummy_vjp.out_tree, data[0], data[1]
-  # )
-
-  return f_vjp_unpacked
-  # assert isinstance(f_vjp_unpacked, tuple)
-  # assert len(f_vjp_unpacked) == 2
-
-  # data, metadata = f_vjp_unpacked
-  # args_res, opaque_residuals = data
-  # fun, in_tree, out_tree = metadata
-  
-  # return VJP(fun, in_tree, out_tree, args_res, opaque_residuals)
-
-def with_vjp_unpack(fwd):
-  return fwd
-  # @wraps(fwd)
-  # def wrapper(*args, **kwargs):
-  #   out = fwd(*args, **kwargs)
-  #   assert 2 <= len(out) <= 3
-  #   return tuple_update(out, 1, vjp_unpack(out[1]))
-  # return wrapper
-
-def with_vjp_pack(bwd):
-  return bwd
-  # @wraps(bwd)
-  # def wrapper(*args, **kwargs):
-  #   assert len(args) == 3
-  #   args = tuple_update(args, 0, vjp_pack(args[0]))
-  #   return bwd(*args, **kwargs)
-  # return wrapper
+  if jitted:
+    fwd = jax.jit(fwd)
+    bwd = jax.jit(bwd)
+  return fwd, bwd
 
 
 ### Various debugging utilities
@@ -239,6 +152,7 @@ def annotate(name, color):
 
 def annotate_step(fn, start_step=4, end_step=6):
   step = 0
+
   @wraps(fn)
   def wrapper(*args, **kwargs):
     nonlocal step
@@ -250,4 +164,5 @@ def annotate_step(fn, start_step=4, end_step=6):
       libcudart.cudaProfilerStop()
     step += 1
     return res
+
   return wrapper

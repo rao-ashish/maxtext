@@ -408,9 +408,22 @@ def train_loop(config, recorder, state=None):
 
   params_shardings, state_mesh_shardings = maxtext_utils.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
 
+  with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+      example_batch = data_loader.load_next_batch()
+
   _train_step = mmpp.train_step if config.use_mmpp else train_step
   state, init_rng, p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(
-      config, init_rng, data_loader, model, mesh, state, state_mesh_shardings, _train_step, eval_step, eval_data_iterator, params_shardings
+      config,
+      init_rng,
+      example_batch,
+      model,
+      mesh,
+      state,
+      state_mesh_shardings,
+      _train_step,
+      eval_step,
+      eval_data_iterator,
+      params_shardings,
   )
 
   if not config.use_mmpp:
@@ -428,7 +441,8 @@ def train_loop(config, recorder, state=None):
   prof = profiler.Profiler(config, offset_step=start_step)
 
   # Write train config params, num model params, and XLA flags to tensorboard
-  # metric_logger.write_setup_info_to_tensorboard(state.params)
+  params_to_log = (s.params for s in state) if isinstance(state, tuple) else state.params
+  metric_logger.write_setup_info_to_tensorboard(params_to_log)
 
   try:
     last_step_completion = datetime.datetime.now()

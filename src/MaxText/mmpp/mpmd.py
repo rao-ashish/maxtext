@@ -21,7 +21,7 @@ from flax.linen import partitioning as nn_partitioning
 def slice_mesh(mesh, axis_name, slice_index):
   axis = mesh.axis_names.index(axis_name)
   devices = mesh.devices.take(indices=slice_index, axis=axis)
-  return Mesh(devices, mesh.axis_names[:axis] + mesh.axis_names[axis+1:])
+  return Mesh(devices, mesh.axis_names[:axis] + mesh.axis_names[axis + 1 :])
 
 
 def get_stage_mesh(global_mesh: Mesh, stage_index: int) -> Mesh:
@@ -34,15 +34,12 @@ def sharding_with_mesh(s, mesh):
   return NamedSharding(mesh, s.spec, memory_kind=s.memory_kind)
 
 
-def adjust_to_stage_mesh(stage_mesh, shardings, force_pytree_def=None):
+def adjust_to_stage_mesh(stage_mesh, shardings):
   out = jax.tree.map(partial(sharding_with_mesh, mesh=stage_mesh), shardings)
-  if force_pytree_def is not None:
-    out = jax.tree.unflatten(force_pytree_def, 
-      jax.tree.flatten(out, is_leaf=is_jax_partial)[0])
   return out
 
 
-SectionKind = Enum('SectionKind', 'Prologue Forward Backward BackwardLast Epilogue')
+SectionKind = Enum("SectionKind", "Prologue Forward Backward BackwardLast Epilogue")
 StageIndex = int
 SectionName = tuple[SectionKind, StageIndex]
 
@@ -86,10 +83,11 @@ class Context:
 
 _mmpp_context: Optional[Context] = None
 
+
 def get_context() -> Context:
-  assert _mmpp_context is not None, \
-    'Context unavailable. Are you calling from outside mmpp.mpmd.transform?'
+  assert _mmpp_context is not None, "Context unavailable. Are you calling from outside mmpp.mpmd.transform?"
   return _mmpp_context
+
 
 def get_context_or_fallback(mesh) -> Context:
   if _mmpp_context is None:
@@ -100,6 +98,7 @@ def get_context_or_fallback(mesh) -> Context:
         section_decorator=None,
     )
   return _mmpp_context
+
 
 @contextlib.contextmanager
 def set_context(ctx: Context):
@@ -157,6 +156,7 @@ def sharding_extractor():
   def dump_shardings(fun):
     in_shardings, in_tree = None, None
     out_shardings, out_tree = None, None
+
     @wraps(fun)
     def wrapper(*args):
       nonlocal in_shardings, in_tree
@@ -167,21 +167,22 @@ def sharding_extractor():
         in_shardings, in_tree = register_store_callbacks(args)
         out_shardings, out_tree = register_store_callbacks(res)
       return res
+
     return (
-      wrapper,
-      lambda: jax.tree.unflatten(in_tree, in_shardings),
-      lambda: jax.tree.unflatten(out_tree, out_shardings),
+        wrapper,
+        lambda: jax.tree.unflatten(in_tree, in_shardings),
+        lambda: jax.tree.unflatten(out_tree, out_shardings),
     )
 
   return dump_shardings
 
 
 def test_sharding_extractor():
-  mesh = Mesh(np.array(jax.devices()).reshape((4,2)), ('a', 'b'))
+  mesh = Mesh(np.array(jax.devices()).reshape((4, 2)), ("a", "b"))
   s0 = NamedSharding(mesh, P())
-  s1 = NamedSharding(mesh, P('a'))
-  s2 = NamedSharding(mesh, P(None, 'b'))
-  s3 = NamedSharding(mesh, P('a', 'b'))
+  s1 = NamedSharding(mesh, P("a"))
+  s2 = NamedSharding(mesh, P(None, "b"))
+  s3 = NamedSharding(mesh, P("a", "b"))
 
   def foo(x, y):
     z = jax.lax.with_sharding_constraint(x[0] * x[1], s1)
@@ -197,18 +198,20 @@ def test_sharding_extractor():
   specs = lambda ss: jax.tree.map(lambda s: s.spec, ss)
   in_specs = specs(ins_thunk())
   out_specs = specs(outs_thunk())
-  assert in_specs == specs(((s0, s1), s2)), f'unexpected in specs {in_specs=}'
-  assert out_specs == specs((s1, s3)), f'unexpected out specs {out_specs=}'
+  assert in_specs == specs(((s0, s1), s2)), f"unexpected in specs {in_specs=}"
+  assert out_specs == specs((s1, s3)), f"unexpected out specs {out_specs=}"
 
 
 def check_args_mesh(name, stage_mesh, args):
   bad = []
+
   def collect(path, x):
     if isinstance(x, jax.Array) and not (
       isinstance(x.sharding, NamedSharding) and
       (x_mesh := x.sharding.mesh) == stage_mesh
     ):
       bad.append((path, x.sharding._device_assignment))
+
   jax.tree.map_with_path(collect, args)
   if bad:
     bad_str = "\n  ".join(f"{path}: {devices}" for path, devices in bad)
@@ -219,11 +222,19 @@ def check_args_mesh(name, stage_mesh, args):
 
 
 def transform(
-    mesh, section_fns, step_fn, step_in_shardings, step_out_shardings, state, example_batch, init_rng, axis_rules,
+    mesh,
+    section_fns,
+    step_fn,
+    step_in_shardings,
+    step_out_shardings,
+    state,
+    example_batch,
+    init_rng,
+    axis_rules,
     print_inferred_shardings=False,
 ):
   # Phase 1: Infer shardings
-  print('PHASE1')
+  print("PHASE1")
 
   dump_shardings = sharding_extractor()
   in_shardings_thunk = {}
@@ -234,70 +245,21 @@ def transform(
       dump_shardings(section_fn)
     return wrapped
 
-  def remove_stage_from_spec(spec):
-    """Remove 'stage' axis from a PartitionSpec."""
-    new_spec_parts = []
-    for part in spec:
-        if part is None:
-            new_spec_parts.append(None)
-        elif isinstance(part, str):
-            if part != 'stage':
-                new_spec_parts.append(part)
-        elif isinstance(part, (tuple, list)):
-            filtered = tuple(p for p in part if p != 'stage')
-            if filtered:  # Only append if not empty
-                new_spec_parts.append(filtered)
-    return P(*new_spec_parts)
-
   def make_shape_dtype(arr):
-    if isinstance(arr, jax.Array) and isinstance(arr.sharding, NamedSharding):
-        new_spec = remove_stage_from_spec(arr.sharding.spec)
-        return jax.ShapeDtypeStruct(
-            arr.shape,
-            arr.dtype,
-            sharding=NamedSharding(stage0_mesh, new_spec, memory_kind=arr.sharding.memory_kind),
-        )
-    return arr
-
-  def reshard_to_stage0(x):
-    if isinstance(x, jax.Array) and isinstance(x.sharding, NamedSharding):
-        new_spec = remove_stage_from_spec(x.sharding.spec)
-        return jax.device_put(x, NamedSharding(stage0_mesh, new_spec))
-    return x
+    return jax.ShapeDtypeStruct(
+        arr.shape,
+        arr.dtype,
+        sharding=sharding_with_mesh(arr.sharding, stage0_mesh),
+    )
 
   ctx = Context(
-    mesh=mesh,
-    tracing_for_inference=True,
-    section_fns=section_fns,
-    section_decorator=dump_section_shardings,
+      mesh=mesh,
+      tracing_for_inference=True,
+      section_fns=section_fns,
+      section_decorator=dump_section_shardings,
   )
   stage0_mesh = ctx.get_stage_mesh(0)
   with set_context(ctx), stage0_mesh, nn_partitioning.axis_rules(axis_rules):
-    # print("example_batch shape:")
-    # print(jax.tree.map(lambda x: x.shape if isinstance(x, jax.Array) else None, example_batch))
-    # print()
-
-    # print("step_in_shardings[1]:")
-    # print(step_in_shardings[1])
-    # print()
-
-    # print("example_batch['inputs'].sharding:")
-    # print(example_batch['inputs'].sharding)
-    # print()
-
-    # print("arg_shape_dtypes:")
-    # for k, v in jax.tree.map(make_shape_dtype, example_batch).items():
-    #   print(k, v)
-    # print()
-
-    # print(f"init_rng type: {init_rng}")
-    # print()
-
-    # print(f"train state types:")
-    # jax.tree.map(lambda x: print(type(x)), state)
-
-    # Just lower to capture shardings via the dump_shardings callbacks
-    # We don't need to compile - lowering is enough to trigger the callbacks
     _ = jax.jit(
         step_fn,
         in_shardings=adjust_to_stage_mesh(stage0_mesh, step_in_shardings),
@@ -323,10 +285,10 @@ def transform(
     for section_name in ctx.section_names():
       ins = jax.tree.map(lambda x: x.spec, section_in_shardings[section_name])
       outs = jax.tree.map(lambda x: x.spec, section_out_shardings[section_name])
-      print(f'  {section_name}:\n\t{ins=}\n\t{outs=}\n')
+      print(f"  {section_name}:\n\t{ins=}\n\t{outs=}\n")
 
   # Phase 2: Produce final jitted sections
-  print('PHASE2')
+  print("PHASE2")
 
   compiled_section_fns = {}
 
@@ -335,68 +297,23 @@ def transform(
   ):
     section_kind, stage_index = section_name
     stage_mesh = get_stage_mesh(mesh, stage_index)
-
+    in_shardings = adjust_to_stage_mesh(stage_mesh, section_in_shardings[section_name])
+    out_shardings = adjust_to_stage_mesh(stage_mesh, section_out_shardings[section_name])
+    section_fn.__name__ = f"section_{section_kind.name}{stage_index}"
+    jitted_section_fn = jax.jit(
+        section_fn,
+        in_shardings=in_shardings,
+        out_shardings=out_shardings,
+        static_argnums=static_argnums,
+        donate_argnums=donate_argnums,
+    )
+    @wraps(jitted_section_fn)
     def apply_stage(*args):
       check_args_mesh(section_name, stage_mesh, args)
       with stage_mesh:
-        if section_name in compiled_section_fns:
-          return compiled_section_fns[section_name](*args)
-
-        _, args_treedef = jax.tree.flatten(args, is_leaf=is_jax_partial)
-
-        in_shardings = adjust_to_stage_mesh(
-          stage_mesh, section_in_shardings[section_name], 
-          force_pytree_def=args_treedef,
-        )
-        out_shardings = adjust_to_stage_mesh(
-          stage_mesh, section_out_shardings[section_name], 
-          # force_pytree_def=args_treedef,
-        )
-
-        section_fn.__name__ = f"section_{section_kind.name}{stage_index}"
-        # compiled_section_fns[section_name] = jax.jit(
-        #     section_fn,
-        #     in_shardings=in_shardings,
-        #     out_shardings=out_shardings,
-        #     static_argnums=static_argnums,
-        #     donate_argnums=donate_argnums,
-        # ).lower(*args).compile()
-
-        compiled_section_fns[section_name] = jax.jit(
-          section_fn,
-          in_shardings=in_shardings,
-          out_shardings=out_shardings,
-          static_argnums=static_argnums,
-          donate_argnums=donate_argnums,
-        )
-
-        with open("jaxpr_dump.txt", "w+") as f:
-          jaxpr = str(jax.make_jaxpr(compiled_section_fns[section_name])(*args))
-          f.write(jaxpr)
-        
-        with open("hlo_dump.txt", "w+") as f:
-          unoptimized_stable_hlo = compiled_section_fns[section_name].lower(*args).as_text()
-          f.write(unoptimized_stable_hlo)
-        
+        if section_name not in compiled_section_fns:
+          compiled_section_fns[section_name] = jitted_section_fn.lower(*args).compile()
         return compiled_section_fns[section_name](*args)
-
-    # in_shardings = adjust_to_stage_mesh(stage_mesh, section_in_shardings[section_name])
-    # out_shardings = adjust_to_stage_mesh(stage_mesh, section_out_shardings[section_name])
-    # section_fn.__name__ = f"section_{section_kind.name}{stage_index}"
-    # jitted_section_fn = jax.jit(
-    #     section_fn,
-    #     in_shardings=in_shardings,
-    #     out_shardings=out_shardings,
-    #     static_argnums=static_argnums,
-    #     donate_argnums=donate_argnums,
-    # )
-    # @wraps(jitted_section_fn)
-    # def apply_stage(*args):
-    #   check_args_mesh(section_name, stage_mesh, args)
-    #   with stage_mesh:
-    #     if section_name not in compiled_section_fns:
-    #       compiled_section_fns[section_name] = jitted_section_fn.lower(*args).compile()
-    #     return compiled_section_fns[section_name](*args)
     return apply_stage
 
   ctx = Context(

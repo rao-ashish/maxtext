@@ -22,9 +22,9 @@ EPS = 1e-8
 
 
 ### The flax model definition
-
 class Transformer(nn.Module):
   """Transformer, specialized for mmpp."""
+
   config: Config
   mesh: Mesh
   quant: Quant
@@ -82,9 +82,7 @@ class Transformer(nn.Module):
     if num_layers_in_stage == 1:
       stage_module = base_stage(config=cfg, mesh=stage_mesh, quant=self.quant, name=name)
     elif cfg.scan_layers:
-      stage_module = self.scan_decoder_layers(
-          cfg, stage_mesh, base_stage, num_layers_in_stage, name
-      )
+      stage_module = self.scan_decoder_layers(cfg, stage_mesh, base_stage, num_layers_in_stage, name)
     else:
       stage_module = decoders.SequentialBlockDecoderLayers(
           decoder_layer=base_stage,
@@ -246,7 +244,6 @@ class Transformer(nn.Module):
 
 
 ### The model loss definition outside flax, as used in mmpp
-
 def loss_and_aux_from_logits(config, data, logits):
   one_hot_targets = jax.nn.one_hot(data["targets"], config.vocab_size)
   xent, _ = max_utils.cross_entropy_with_logits(logits, one_hot_targets, 0.0)
@@ -265,6 +262,7 @@ def loss_and_aux_from_logits(config, data, logits):
       "moe_lb_loss": jnp.array(0.0),
   }
   return loss, aux
+
 
 # NOTE: `forward` essentially splits the monolithic `model.apply` (enters flax once)
 # into one flax entrypoint per stage, `forward(model, stage_index, ...)`, i.e. given
@@ -303,12 +301,7 @@ def forward(
   rngs = {"dropout": rng1, "params": aqt_rng}
 
   for k, v in data.items():
-    data[k] = v[:cfg.micro_batch_size_to_train_on, :]
-
-  if stage_index == 0:
-    print(f"data['inputs'] shape = {data['inputs'].shape}")
-  if input_activations is not None:
-    print(f"input_activations.shape = {input_activations.shape}")
+    data[k] = v[: cfg.micro_batch_size_to_train_on, :]
 
   output_activations = model.apply(
     params,
