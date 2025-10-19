@@ -665,7 +665,7 @@ class Decoder(nn.Module):
         image_masks,
     )
 
-    policy = self.get_remat_policy()
+    policy = self.get_remat_policy(cfg)
     RemattedBlockLayers = self.set_remat_policy(self.decoder_layer, policy)
     # scan does not support kwargs in layer call, passing broadcast_args as positional arg
     broadcast_args = (
