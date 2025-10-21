@@ -20,6 +20,7 @@ import json
 import os
 import queue
 import enum
+import pdb
 
 import numpy as np
 
@@ -221,7 +222,15 @@ class MetricLogger:
     metrics["scalar"].update(
         {"perf/per_device_tokens_per_sec": (self.metadata[MetadataKey.PER_DEVICE_TOKENS] / step_time)}
     )
+
+    print("Before set trace")
+    pdb.set_trace()
+    print("After set trace")
+
+    print("Log the lr")
     metrics["scalar"].update({"learning/current_learning_rate": self.learning_rate_schedule(step)})
+    print("Logged the lr")
+    
     if self.performance_metric_queue:
       self.performance_metric_queue.put(step_time)
 
