@@ -1,6 +1,7 @@
 *__pycache__*
 tmp/
 logs/
+src/scripts/outputs/profiles/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

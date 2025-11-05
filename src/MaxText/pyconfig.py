@@ -1031,17 +1031,28 @@ def set_and_validate_pipeline_config(raw_keys):
           "You should only set pipeline_fsdp_once=True, leave model_fsdp_ag_once=False with pipeline parallelism."
       )
 
-    def modify_activation_embed_and_logits_batch(logical_axis_rules):
+    def modify_logical_axis_rules(logical_axis_rules):
       for idx, logical_rule in enumerate(logical_axis_rules):
-        if logical_rule[0] == "activation_embed_and_logits_batch":
-          # For pipeline parallelism the pre and post decoder layer tensors' batch dimension is sharded by stages.
-          # Microbatches are sharded by stage, so moving out of and into this sharding should be a local reshape.
-          # The "stage" needs to be listed first since the microbatch dimension is first before the reshape.
-          logical_axis_rules[idx] = [
-              "activation_embed_and_logits_batch",
-              ["stage", "data", "fsdp", "fsdp_transpose", "expert"],
-          ]
-          break  # Exit the loop after modifying the list
+        if raw_keys["use_mmpp"]:
+          name, axes = logical_rule
+          if "batch" in name:
+            # For mmpp we explicitly control the DP axis via vmap.
+            remove_axes = ("data", "stage")
+            if name == "activation_embed_and_logits_batch_outside_vmap":
+              remove_axes = ("stage",)
+            new_axes = [axis for axis in axes if axis not in remove_axes]
+            logical_axis_rules[idx] = [name, new_axes]
+        
+        else:
+          if logical_rule[0] == "activation_embed_and_logits_batch":
+            # For pipeline parallelism the pre and post decoder layer tensors' batch dimension is sharded by stages.
+            # Microbatches are sharded by stage, so moving out of and into this sharding should be a local reshape.
+            # The "stage" needs to be listed first since the microbatch dimension is first before the reshape.
+            logical_axis_rules[idx] = [
+                "activation_embed_and_logits_batch",
+                ["stage", "data", "fsdp", "fsdp_transpose", "expert"],
+            ]
+            break  # Exit the loop after modifying the list
       return logical_axis_rules
 
     def pipeline_first_axis(raw_keys):
@@ -1089,8 +1100,7 @@ def set_and_validate_pipeline_config(raw_keys):
           "autoregressive",
       ]
       data_sharding = [
-          [
-              "stage",
+          ([] if raw_keys["use_mmpp"] else ["stage"]) + [
               "data",
               "fsdp",
               "fsdp_transpose",
@@ -1112,7 +1122,7 @@ def set_and_validate_pipeline_config(raw_keys):
       return raw_keys
 
     raw_keys["using_pipeline_parallelism"] = True
-    raw_keys["logical_axis_rules"] = modify_activation_embed_and_logits_batch(raw_keys["logical_axis_rules"])
+    raw_keys["logical_axis_rules"] = modify_logical_axis_rules(raw_keys["logical_axis_rules"])
     raw_keys = pipeline_first_axis(raw_keys)
     num_stages = int(raw_keys["ici_pipeline_parallelism"] * raw_keys["dcn_pipeline_parallelism"])
     if raw_keys["pipeline_parallel_layers"] == -1:

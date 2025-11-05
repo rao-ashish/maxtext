@@ -43,6 +43,8 @@ from cloud_tpu_diagnostics.configuration import debug_configuration
 from cloud_tpu_diagnostics.configuration import diagnostic_configuration
 from cloud_tpu_diagnostics.configuration import stack_trace_configuration
 
+from MaxText import mmpp
+
 from MaxText import checkpointing
 from MaxText import exceptions
 from MaxText import max_logging
@@ -370,6 +372,9 @@ def train_loop(config, recorder, state=None):
       state,
   ) = train_utils.setup_train_loop(config, recorder)
 
+  data_loader = create_dataloader(config, mesh, data_iterator, recorder)
+  metric_logger = MetricLogger(config=config, learning_rate_schedule=learning_rate_schedule)
+
   if config.use_dpo:
     if "reference_params" not in state.params:
       reference_params = jax.tree.map(jnp.copy, state.params["params"])
@@ -378,25 +383,42 @@ def train_loop(config, recorder, state=None):
 
   params_shardings, state_mesh_shardings = sharding.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
 
-  p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(
-      config, model, mesh, state, state_mesh_shardings, train_step, eval_step, eval_data_iterator, params_shardings
+  with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+      example_batch = data_loader.load_next_batch()
+
+  _train_step = mmpp.train_step if config.use_mmpp else train_step
+  state, init_rng, p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(
+      config,
+      init_rng,
+      example_batch,
+      model,
+      mesh,
+      state,
+      state_mesh_shardings,
+      _train_step,
+      eval_step,
+      eval_data_iterator,
+      params_shardings,
   )
 
-  with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-    shaped_batch = maxtext_utils.get_shaped_batch(config)
-    if config.shard_optimizer_over_data:
-      state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
-    compiled = p_train_step.lower(state, shaped_batch, init_rng).compile()
-    compiled_stats = compiled.memory_analysis()
-    max_utils.print_compiled_memory_stats(compiled_stats)
+  if not config.use_mmpp:
+    with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
+      shaped_batch = maxtext_utils.get_shaped_batch(config)
+      if config.shard_optimizer_over_data:
+        state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
+      compiled = p_train_step.lower(state, shaped_batch, init_rng).compile()
+      compiled_stats = compiled.memory_analysis()
+      max_utils.print_compiled_memory_stats(compiled_stats)
 
-  start_step = get_first_step(state)  # this is the start_step for training
+  if config.use_mmpp:
+    start_step = 0
+  else:
+    start_step = get_first_step(state)  # this is the start_step for training
   prof = profiler.Profiler(config, offset_step=start_step)
-  data_loader = create_dataloader(config, mesh, data_iterator, recorder)
-  metric_logger = MetricLogger(config=config, learning_rate_schedule=learning_rate_schedule)
 
   # Write train config params, num model params, and XLA flags to tensorboard
-  metric_logger.write_setup_info_to_tensorboard(state.params)
+  params_to_log = (s.params for s in state) if isinstance(state, tuple) else state.params
+  metric_logger.write_setup_info_to_tensorboard(params_to_log)
 
   try:
     last_step_completion = datetime.datetime.now()
@@ -415,7 +437,7 @@ def train_loop(config, recorder, state=None):
         nextrng = jax.jit(jax.random.fold_in)(init_rng, step)
         with maybe_record_goodput(recorder, GoodputEvent.STEP, step):
           with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-            if config.shard_optimizer_over_data:
+            if config.shard_optimizer_over_data and not config.use_mmpp:
               state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
             state, metrics = p_train_step(state, example_batch, nextrng)
 
@@ -461,7 +483,8 @@ def train_loop(config, recorder, state=None):
       if step == start_step:
         max_utils.print_mem_stats("After params initialized")
 
-      metric_logger.buffer_and_write_train_metrics(metrics, step, step_time_delta)
+      if not config.use_mmpp or (config.use_mmpp and jax.process_index() == jax.process_count() - 1):
+        metric_logger.buffer_and_write_train_metrics(metrics, step, step_time_delta)
 
     if config.save_checkpoint_on_completion:
       state_to_save = state if not config.use_dpo else _split_dpo_state(state)[0]
@@ -472,7 +495,8 @@ def train_loop(config, recorder, state=None):
   except exceptions.StopTraining as e:
     max_logging.log(f"Training stopped: {str(e)}")
   finally:
-    metric_logger.flush_metrics_and_cleanup()
+    if not config.use_mmpp or (config.use_mmpp and jax.process_index() == jax.process_count() - 1):
+      metric_logger.flush_metrics_and_cleanup()
 
   return state
 

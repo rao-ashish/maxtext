@@ -263,16 +263,17 @@ class Decoder(nn.Module):
 
   def setup(self):
     """Initialize decoder layer."""
-    self.decoder_layer = self.get_decoder_layers()
-    self.norm_layer = self.get_norm_layer(num_features=self.config.emb_dim)
+    self.decoder_layer = self.get_decoder_layers(self.config)
+    self.norm_layer = self.get_norm_layer(self.config, num_features=self.config.emb_dim)
     if self.config.using_pipeline_parallelism:
       pipeline_stage_module = self.get_pipeline_stage_module(self.decoder_layer)
-      remat_policy = self.get_remat_policy()
+      remat_policy = self.get_remat_policy(self.config)
       self.pipeline_module = pipeline.Pipeline(
           config=self.config, mesh=self.mesh, layers=pipeline_stage_module, remat_policy=remat_policy
       )
 
-  def minimal_policy(self, with_context=False):
+  @staticmethod
+  def minimal_policy(with_context=False):
     """Helper for creating minimal checkpoint policies."""
     names = [
         "query_proj",
@@ -289,20 +290,20 @@ class Decoder(nn.Module):
       names.append("context")
     return jax.checkpoint_policies.save_only_these_names(*names)
 
-  def get_remat_policy(self):
+  @staticmethod
+  def get_remat_policy(cfg):
     """Get remat policy"""
     policy = None
-    cfg = self.config
     if cfg.remat_policy != "none":
       if cfg.remat_policy in ("minimal_with_context", "minimal_flash"):
         # save all
         if cfg.remat_policy == "minimal_flash":
           max_logging.log("WARNING: 'minimal_flash' will be deprecated soon, please use 'minimal_with_context' instead.")
           max_logging.log("WARNING: 'minimal_flash' will be deprecated soon, please use 'minimal_with_context' instead.")
-        policy = self.minimal_policy(with_context=True)
+        policy = Decoder.minimal_policy(with_context=True)
       elif cfg.remat_policy == "minimal":
         # save all except context
-        policy = self.minimal_policy()
+        policy = Decoder.minimal_policy()
       elif cfg.remat_policy == "save_dot_with_context_except_mlp":
         policy = jax.checkpoint_policies.save_only_these_names(
             "query_proj",
@@ -377,13 +378,14 @@ class Decoder(nn.Module):
         policy = None
     return policy
 
-  def get_decoder_layers(self):
+  @staticmethod
+  def get_decoder_layers(cfg):
     """Retrieves a list of decoder layer classes based on the `decoder_block` config.
 
     Returns:
         A list containing one or more `nn.Module` classes for the decoder.
     """
-    match self.config.decoder_block:
+    match cfg.decoder_block:
       case DecoderBlockType.DEFAULT:
         return [DecoderLayer]
       case DecoderBlockType.LLAMA2:
@@ -394,7 +396,7 @@ class Decoder(nn.Module):
       case DecoderBlockType.MIXTRAL:
         return [mixtral.MixtralDecoderLayerToLinen]
       case DecoderBlockType.DEEPSEEK:
-        if self.config.use_batch_split_schedule:
+        if cfg.use_batch_split_schedule:
           return [deepseek_batchsplit.DeepSeekDenseLayer, deepseek_batchsplit.DeepSeekMoELayer]
         else:
           return [deepseek.DeepSeekDenseLayer, deepseek.DeepSeekMoELayer]
@@ -407,22 +409,22 @@ class Decoder(nn.Module):
       case DecoderBlockType.GPT3:
         return [gpt3.Gpt3DecoderLayer]
       case DecoderBlockType.GPT_OSS:
-        return [gpt_oss.GptOssScannableBlockToLinen] if self.config.scan_layers else [gpt_oss.GptOssDecoderLayerToLinen]
+        return [gpt_oss.GptOssScannableBlockToLinen] if cfg.scan_layers else [gpt_oss.GptOssDecoderLayerToLinen]
       case DecoderBlockType.QWEN3:
         return [qwen3.Qwen3DecoderLayerToLinen]
       case DecoderBlockType.QWEN3_MOE:
         return [qwen3.Qwen3MoeDecoderLayerToLinen]
       case DecoderBlockType.QWEN3_NEXT:
-        return [qwen3.Qwen3NextScannableBlockToLinen] if self.config.scan_layers else [qwen3.Qwen3NextDecoderLayerToLinen]
+        return [qwen3.Qwen3NextScannableBlockToLinen] if cfg.scan_layers else [qwen3.Qwen3NextDecoderLayerToLinen]
       case DecoderBlockType.SIMPLE:
         return [simple_layer.SimpleDecoderLayerToLinen]
       case DecoderBlockType.SIMPLE_MLP:
         return [simple_layer.SimpleMlpDecoderLayerToLinen]
       case DecoderBlockType.LLAMA4:
-        return [llama4.Llama4ScannableBlockToLinen] if self.config.scan_layers else [llama4.Llama4DecoderLayerToLinen]
+        return [llama4.Llama4ScannableBlockToLinen] if cfg.scan_layers else [llama4.Llama4DecoderLayerToLinen]
       case _:
         # Default case to handle any unknown decoder block types.
-        raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block.value=}")
+        raise ValueError(f"Incorrect decoder_block name {cfg.decoder_block.value=}")
 
   def set_remat_policy(self, block_layers, policy):
     """Set remat policy"""
@@ -452,9 +454,10 @@ class Decoder(nn.Module):
       RemattedBlockLayers.append(layer)
     return RemattedBlockLayers
 
-  def get_norm_layer(self, num_features: int):
+  @staticmethod
+  def get_norm_layer(cfg, num_features: int):
     """get normalization layer (return type inherits from nn.Module)"""
-    if self.config.decoder_block in (
+    if cfg.decoder_block in (
         DecoderBlockType.DEFAULT,
         DecoderBlockType.LLAMA2,
         DecoderBlockType.MISTRAL,
@@ -471,11 +474,11 @@ class Decoder(nn.Module):
         DecoderBlockType.SIMPLE_MLP,
         DecoderBlockType.LLAMA4,
     ):
-      return functools.partial(rms_norm, num_features=num_features, shard_mode=self.config.shard_mode)
-    elif self.config.decoder_block == DecoderBlockType.GPT3:
+      return functools.partial(rms_norm, num_features=num_features, shard_mode=cfg.shard_mode)
+    elif cfg.decoder_block == DecoderBlockType.GPT3:
       return functools.partial(gpt3.gpt3_layer_norm, num_features=num_features, reductions_in_fp32=False, use_bias=True)
     else:
-      raise ValueError(f"Incorrect decoder_block name {self.config.decoder_block.value=}")
+      raise ValueError(f"Incorrect decoder_block name {cfg.decoder_block.value=}")
 
   def scan_decoder_layers(self, cfg, decoder_layer, length, metadata_axis_name, mesh, in_axes_tuple, **kwargs):
     """scan decoder layers, calls `flax.linen.transforms.scan`"""
@@ -515,7 +518,7 @@ class Decoder(nn.Module):
     cfg = self.config
     base_stage = get_layer_to_pipeline(decoder_blocks, cfg)
     if cfg.set_remat_policy_on_layers_per_stage:
-      policy = self.get_remat_policy()
+      policy = self.get_remat_policy(cfg)
       base_stage = self.set_remat_policy([base_stage], policy)[0]
     if cfg.num_layers_per_pipeline_stage == 1:
       stage_module = base_stage(config=cfg, mesh=self.mesh, quant=self.quant, model_mode=self.model_mode)
@@ -606,7 +609,7 @@ class Decoder(nn.Module):
     else:
       norm_out_sharding = None
 
-    y = self.get_norm_layer(num_features=y.shape[-1])(
+    y = self.get_norm_layer(cfg, num_features=y.shape[-1])(
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
         name="decoder_norm",
@@ -701,7 +704,7 @@ class Decoder(nn.Module):
         image_masks,
     )
 
-    policy = self.get_remat_policy()
+    policy = self.get_remat_policy(cfg)
     RemattedBlockLayers = self.set_remat_policy(self.decoder_layer, policy)
     # scan does not support kwargs in layer call, passing broadcast_args as positional arg
     broadcast_args = (

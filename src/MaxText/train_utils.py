@@ -28,6 +28,10 @@ from MaxText.utils.goodput_utils import GoodputEvent
 from MaxText.utils.goodput_utils import maybe_record_goodput
 from MaxText import model_creation_utils
 
+from MaxText import mmpp
+
+from flax.linen import partitioning as nn_partitioning
+
 
 def create_training_tools(config, model, mesh):
   """Creates the init_rng, optimizer, learning rate schedule, and checkpoint manager."""
@@ -131,6 +135,8 @@ def jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step)
 
 def jit_train_and_eval_step(
     config,
+    init_rng,
+    example_batch,
     model,
     mesh,
     state,
@@ -142,12 +148,40 @@ def jit_train_and_eval_step(
 ):
   """Returns a JIT-compiled train and eval step function."""
   data_sharding = sharding.get_input_data_sharding(config, mesh)
-  p_train_step = jit_train_step(config, model, state, state_mesh_shardings, data_sharding, train_step, params_shardings)
+
+  if config.use_mmpp:
+    (
+      functional_train,
+      in_shardings,
+      out_shardings,
+      static_argnums,
+      donate_argnums,
+    ) = maxtext_utils.get_functional_train_with_signature(
+        train_step, data_sharding, state_mesh_shardings, model, config, params_shardings
+    )
+
+    state, init_rng, p_train_step = mmpp.prepare_state_and_train_step(
+          mesh,
+          model,
+          state,
+          init_rng,
+          functional_train,
+          in_shardings,
+          out_shardings,
+          example_batch,
+      )
+  
+  else:
+    p_train_step = jit_train_step(
+        config, model, state, state_mesh_shardings, data_sharding, train_step, params_shardings
+    )
+  
   p_eval_step = None
   if eval_data_iterator:
+    assert not config.use_mmpp
     p_eval_step = jit_eval_step(config, model, state_mesh_shardings, data_sharding, eval_step)
 
-  return p_train_step, p_eval_step
+  return state, init_rng, p_train_step, p_eval_step
 
 
 def setup_train_loop(config, recorder, devices=None):

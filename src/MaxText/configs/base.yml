@@ -260,6 +260,8 @@ scan_layers_per_stage: False
 set_remat_policy_on_pipeline_iterations: True
 set_remat_policy_on_layers_per_stage: False
 
+# Whether to use MPMD pipeline parallelism.
+use_mmpp: False
 
 # Choose 'remat_policy' between 'minimal_with_context', 'minimal', 'save_dot_with_context_except_mlp', 'save_dot_except_mlpwi', 'save_dot_except_mlp',
 # 'save_qkv_proj', 'qkv_proj_offloaded', 'custom', 'minimal_offloaded', 'save_out_proj' and 'full'.
@@ -281,7 +283,7 @@ out_proj: 'remat'
 
 optimizer_memory_host_offload: False
 parameter_memory_host_offload: False
-scan_layers: True # We recommend setting this to false when using pipeline parallelism, instead scanning the PP iterations.
+scan_layers: False # We recommend setting this to false when using pipeline parallelism, instead scanning the PP iterations.
 param_scan_axis: 1
 
 # The attention parameter dictates the specific algorithm/methodology used to compute the attention scores
@@ -364,6 +366,7 @@ logical_axis_rules: [
                       ['activation_batch', ['data', 'fsdp', 'fsdp_transpose', 'expert']],
                       ['activation_batch_no_exp', ['data', 'fsdp', 'fsdp_transpose']],
                       ['activation_embed_and_logits_batch', ['data', 'stage', 'fsdp', 'fsdp_transpose', 'expert']],
+                      ['activation_embed_and_logits_batch_outside_vmap', ['data', 'stage', 'fsdp', 'fsdp_transpose', 'expert']],
                       ['activation_embed_and_logits_batch_sequence', ['data', 'stage', 'fsdp', 'fsdp_transpose', 'sequence', 'context', 'expert']],
                       ['activation_heads', ['tensor', 'tensor_transpose', 'sequence','tensor_sequence','autoregressive']],
                       ['activation_kv_heads', ['tensor', 'tensor_transpose', 'sequence','tensor_sequence']],
@@ -438,7 +441,7 @@ logical_axis_rules: [
                     ]
 # Axes used for DCN must be earlier in this list than ICI, see (b/339009148) for details
 data_sharding: [['data', 'stage', 'fsdp', 'fsdp_transpose', 'sequence', 'context', 'context_autoregressive', 'tensor', 'tensor_transpose', 'tensor_sequence', 'expert', 'autoregressive']]
-input_data_sharding_logical_axes: ['activation_embed_and_logits_batch', 'activation_norm_length']
+input_data_sharding_logical_axes: ['activation_embed_and_logits_batch_outside_vmap', 'activation_norm_length']
 
 # sharding tolerance: float between 0.0 and 1.0 representing the allowed percentage of non-sharded parameters.
 sharding_tolerance: 0.02
