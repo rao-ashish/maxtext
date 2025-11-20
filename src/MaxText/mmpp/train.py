@@ -5,6 +5,9 @@ import dataclasses
 from functools import partial
 from typing import Any, Callable
 
+import threading
+from queue import SimpleQueue
+
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
 from flax.training import train_state
@@ -138,10 +141,10 @@ def get_section_fns(model, state_by_stage) -> dict[mpmd.SectionName, Callable]:
 ### Managing flax and optax state
 
 def remove_mesh_axis(
-    arr: Any,
-    mesh_axis_name: str,
-    mesh_axis_slice_idx: int,
-    ctx: Any = None,
+  arr: Any,
+  mesh_axis_name: str,
+  mesh_axis_slice_idx: int,
+  ctx: Any = None,
 ) -> Any:
   if ctx is not None and ctx.tracing_for_inference:
     return arr
@@ -179,9 +182,20 @@ def remove_mesh_axis(
   )
   new_sharding = NamedSharding(new_mesh, pspec)
 
-  # Transfer to host, then to desired sharding.
-  arr_host_np = np.asarray(arr)
-  return jnp.array(arr_host_np, device=new_sharding)
+  # Form the new array.
+  device_to_buffer = {s.device: s.data for s in arr.addressable_shards}
+  ordered_arrs = []
+
+  for device in new_mesh.devices.flat:
+    if device in device_to_buffer:
+      ordered_arrs.append(device_to_buffer[device])
+  
+  return jax.make_array_from_single_device_arrays(
+    arr.shape,
+    new_sharding,
+    ordered_arrs,
+    dtype=arr.dtype,
+  )
 
 def split_params_by_stage(num_stages, all_params):
   # Assumption: no params are shared between stages; we specialize to Transformer.
@@ -305,6 +319,157 @@ def split_and_transfer_state(
 
 ### Train step
 
+def value_and_grad_multithread(
+  ctx,
+  num_stages,
+  num_mubatches,
+  params_by_stage,
+  data_by_stage,
+  dropout_rngs,
+  print_memory_usage=False,
+):
+  if ctx.tracing_for_inference:
+    return value_and_grad_single_threaded(
+      ctx,
+      num_stages,
+      num_mubatches,
+      params_by_stage,
+      data_by_stage,
+      dropout_rngs,
+      print_memory_usage,
+    )
+
+  assert num_stages == len(params_by_stage) == len(data_by_stage)
+
+  ### State
+  fwd_input = [SimpleQueue() for _ in range(num_stages)]
+  stashed = [SimpleQueue() for _ in range(num_stages)]
+  bwd_input = [SimpleQueue() for _ in range(num_stages)]
+
+  params_by_stage = list(params_by_stage)
+  grads_by_stage = [None] * num_stages
+  loss = [None] * num_mubatches
+  aux = [None] * num_mubatches
+
+  # We are assuming that for any stage queue, there is only one stage that
+  # will push work onto it. This means we can always pop the most recent
+  # element to get the inputs for the next stage we need to work on.
+  def stage_fn(stage_idx):
+    # Form schedule.
+    my_tasks = [
+      (mubatch_idx, is_fwd)
+      for mubatch_idx in range(num_mubatches)
+      for is_fwd in (False, True)
+    ]
+    def task_key(task):
+      mubatch_idx, is_bwd = task
+      s = -stage_idx if is_bwd else stage_idx
+      return (is_bwd, mubatch_idx + s, s)
+    my_tasks.sort(key=task_key)
+
+    # Run initialization for the stage.
+    fwd_fn = ctx.section(
+      (mpmd.SectionKind.Forward, stage_idx),
+      donate_argnums=(0,1,),
+    )
+    bwd_fn = ctx.section(
+      (mpmd.SectionKind.Backward, stage_idx),
+      donate_argnums=(0,1,2,3),
+    )
+    my_params = params_by_stage[stage_idx]
+    my_replicated_data = data_by_stage[stage_idx]
+    my_dropout_rng = transfer(stage_idx, dropout_rngs[stage_idx])
+    
+    ## Initialize my_grads, my_mubatch_idx_consts.
+    _init_stage = ctx.section((mpmd.SectionKind.Prologue, stage_idx))
+    with utils.annotate(f"init{stage_idx}", color="green"):
+      my_grads, mubatch_const_ones, my_mubatch_idx_consts = _init_stage()
+    assert num_mubatches == len(mubatch_const_ones) == len(my_mubatch_idx_consts)
+
+    ## Populate initial inputs for fwds.
+    if stage_idx == 0:
+      for mubatch_idx, is_bwd in my_tasks:
+        if not is_bwd:
+          fwd_input[stage_idx].put(None)
+
+    # Populate initial inputs for bwds.
+    if stage_idx == num_stages - 1:
+      for mubatch_idx, is_bwd in my_tasks:
+        if is_bwd:
+          bwd_input[stage_idx].put(mubatch_const_ones[mubatch_idx])
+
+    # Run main pipeline loop.
+    for mubatch_idx, is_bwd in my_tasks:
+      ## Forward
+      if not is_bwd:
+        print(f"stage {stage_idx} fwd: executing fwd, mubatch_idx={mubatch_idx}", flush=True)
+        res = fwd_fn(
+            my_params,
+            fwd_input[stage_idx].get(),
+            my_replicated_data,
+            my_dropout_rng,
+            my_mubatch_idx_consts[mubatch_idx],
+        )
+        print(f"stage {stage_idx} fwd: finished fwd, mubatch_idx={mubatch_idx}", flush=True)
+        
+        my_params = res[0]
+
+        print(f"stage {stage_idx}: putting stashed onto {stage_idx}", flush=True)
+        stashed[stage_idx].put(res[1])
+        print(f"stage {stage_idx}: put stashed onto {stage_idx}", flush=True)
+        activation = res[2]
+        
+        if stage_idx == num_stages - 1:
+          loss[mubatch_idx] = activation
+          aux[mubatch_idx] = res[3]
+        else:
+          print(f"stage {stage_idx} fwd: transferring activation to stage {stage_idx + 1}", flush=True)
+          activation = transfer(stage_idx + 1, activation)
+          print(f"stage {stage_idx} fwd: putting transferred activation on stage {stage_idx + 1} queue", flush=True)
+          fwd_input[stage_idx + 1].put(activation)
+          print(f"stage {stage_idx} fwd: put transferred activation on stage {stage_idx + 1} queue", flush=True)
+        del res
+        del activation
+      
+      ## Backward
+      else:
+        print(f"stage {stage_idx} bwd: executing bwd, mubatch_idx={mubatch_idx}", flush=True)
+        my_params, my_grads, activation_cot = bwd_fn(
+            my_params,
+            stashed[stage_idx].get(),
+            bwd_input[stage_idx].get(),
+            my_grads,
+        )
+        print(f"stage {stage_idx} bwd: finished bwd, mubatch_idx={mubatch_idx}")
+        if stage_idx - 1 >= 0:
+          print(f"stage {stage_idx} bwd: transferring activation_cot to stage {stage_idx - 1}")
+          activation_cot = transfer(stage_idx - 1, activation_cot)
+          print(f"stage {stage_idx} bwd: putting transferred activation_cot on stage {stage_idx - 1} queue")
+          bwd_input[stage_idx - 1].put(activation_cot)
+          print(f"stage {stage_idx} bwd: put transferred activation_cot on stage {stage_idx - 1} queue")
+        del activation_cot
+    
+    # Update globally accessible lists.
+    grads_by_stage[stage_idx] = my_grads
+    params_by_stage[stage_idx] = my_params
+  
+  # Start stage threads.
+  threads = []
+  for stage_idx in range(num_stages):
+    stage_thread = threading.Thread(target=stage_fn, args=(stage_idx,))
+    stage_thread.start()
+    threads.append(stage_thread)
+  
+  for stage_thread in threads:
+    stage_thread.join()
+
+  stack_mean = lambda x: jnp.mean(jnp.stack(x), axis=(0, 1))
+  loss = stack_mean(loss)
+  aux = jax.tree.map(lambda *xs: stack_mean(xs), *aux)
+  
+  return params_by_stage, grads_by_stage, (loss, aux)
+
+
 
 # TODO: Make sure we only transfer inputs actually needed by a section
 def value_and_grad(
@@ -344,19 +509,29 @@ def value_and_grad(
   tasks.sort(key=task_key)
 
   ### State
+  fwd_input = [[None for _ in range(num_mubatches)] for _ in range(num_stages)]
+  stashed = [[None for _ in range(num_mubatches)] for _ in range(num_stages)]
+  bwd_input = [[None for _ in range(num_mubatches)] for _ in range(num_stages)]
+
+  fwd_fns = [
+    ctx.section(
+          (mpmd.SectionKind.Forward, stage_idx),
+          donate_argnums=(0,1,),
+    )
+    for stage_idx in range(num_stages)
+  ]
+  bwd_fns = [
+    ctx.section(
+          (mpmd.SectionKind.Backward, stage_idx),
+          donate_argnums=(0,1,2,3),
+    )
+    for stage_idx in range(num_stages)
+  ]
+
   # params_by_stage : stage_idx -> params
   params_by_stage = list(params_by_stage)
-  # fwd_input : (mubatch_idx, stage_idx) -> input/activation
-  fwd_input = {
-    (mubatch_idx, 0): None
-    for mubatch_idx in range(num_mubatches)
-  }
-  # stashed : (mubatch_idx, stage_idx) -> stashed residuals
-  stashed = {}
-  # bwd_input : (mubatch_idx, stage_idx) -> activation
-  bwd_input = {}
   # grads_by_stage : stage_idx -> grads
-  grads_by_stage = []
+  grads_by_stage = [None] * num_stages
   # loss : mubatch_idx -> loss
   loss = [None] * num_mubatches
   aux = [None] * num_mubatches
@@ -367,19 +542,19 @@ def value_and_grad(
     for stage_idx in range(num_stages)
   )
   # mubatch_idx_consts_by_stage : stage_idx -> mubatch_idx -> const
-  mubatch_idx_consts_by_stage = []
+  mubatch_idx_consts_by_stage = [None] * num_stages
 
   ### Run initialization for each stage
   for stage_idx in range(num_stages):
     _init_stage = ctx.section((mpmd.SectionKind.Prologue, stage_idx))
     with utils.annotate(f"init{stage_idx}", color="green"):
       grads, mubatch_const_ones, idx_consts = _init_stage()
-    grads_by_stage.append(grads)
+    grads_by_stage[stage_idx] = grads
     assert num_mubatches == len(mubatch_const_ones) == len(idx_consts)
-    mubatch_idx_consts_by_stage.append(idx_consts)
+    mubatch_idx_consts_by_stage[stage_idx] = idx_consts
     if stage_idx == num_stages - 1:
       for mubatch_idx, const_ones in enumerate(mubatch_const_ones):
-        bwd_input[(mubatch_idx, stage_idx)] = const_ones
+        bwd_input[stage_idx][mubatch_idx] = const_ones
 
   def memory_usage_snapshot(name):
     if not print_memory_usage or ctx.tracing_for_inference:
@@ -401,58 +576,51 @@ def value_and_grad(
 
   ### Microbatched forward+backward
   memory_usage_snapshot("start")
+  
   for mubatch_idx, stage_idx, is_bwd in tasks:
-    fwd_bwd_str = "B" if is_bwd else "F"
-    color = "blue" if is_bwd else "red"
-    task_name = f"mub{mubatch_idx}/{fwd_bwd_str}{stage_idx}"
-    print(f"TASK {task_name}")
-    with utils.annotate(task_name, color=color):
-      curr_id = (mubatch_idx, stage_idx)
+    with utils.annotate(f"TASK m{mubatch_idx} s{stage_idx} {'BWD' if is_bwd else 'FWD'}", color="blue"):
+      ### Forward
       if not is_bwd:
-        ### Forward
-        succ_id = (mubatch_idx, stage_idx + 1)
-        _fwd = ctx.section(
-            (mpmd.SectionKind.Forward, stage_idx),
-            donate_argnums=(0,1,),
-        )
-        res = _fwd(
+        curr_input = fwd_input[stage_idx][mubatch_idx]
+        fwd_input[stage_idx][mubatch_idx] = None  # Clear reference.
+
+        res = fwd_fns[stage_idx](
             params_by_stage[stage_idx],
-            fwd_input.pop(curr_id),
+            curr_input,
             data_by_stage[stage_idx],
             dropout_rngs[stage_idx],
             mubatch_idx_consts_by_stage[stage_idx][mubatch_idx],
         )
-        params_by_stage[stage_idx], stashed[curr_id], activation = res[:3]
+        
+        params_by_stage[stage_idx] = res[0]
+        stashed[stage_idx][mubatch_idx] = res[1]
+        activation = res[2]
+        
         if stage_idx == num_stages - 1:
           loss[mubatch_idx] = activation
           aux[mubatch_idx] = res[3]
         else:
-          with utils.annotate(
-              f"Tx mub{mubatch_idx} {stage_idx}->{stage_idx+1}", color="yellow",
-          ):
-            fwd_input[succ_id] = transfer(stage_idx + 1, activation)
+          fwd_input[stage_idx + 1][mubatch_idx] = transfer(stage_idx + 1, activation)
         del res
         del activation
+      
+      ### Backward
       else:
-        ### Backward
-        succ_id = (mubatch_idx, stage_idx - 1)
-        _bwd = ctx.section(
-            (mpmd.SectionKind.Backward, stage_idx),
-            donate_argnums=(0, 1, 2, 3),
-        )
-        params_by_stage[stage_idx], grads_by_stage[stage_idx], activation_cot = _bwd(
+        curr_stashed = stashed[stage_idx][mubatch_idx]
+        stashed[stage_idx][mubatch_idx] = None  # Clear reference.
+
+        curr_bwd_input = bwd_input[stage_idx][mubatch_idx]
+        bwd_input[stage_idx][mubatch_idx] = None  # Clear reference.
+
+        params_by_stage[stage_idx], grads_by_stage[stage_idx], activation_cot = bwd_fns[stage_idx](
             params_by_stage[stage_idx],
-            stashed.pop(curr_id),
-            bwd_input.pop(curr_id),
+            curr_stashed,
+            curr_bwd_input,
             grads_by_stage[stage_idx],
         )
         if stage_idx - 1 >= 0:
-          with utils.annotate(
-              f"Tx mub{mubatch_idx} {stage_idx}->{stage_idx-1}", color="orange",
-          ):
-              bwd_input[succ_id] = transfer(stage_idx - 1, activation_cot)
+          bwd_input[stage_idx - 1][mubatch_idx] = transfer(stage_idx - 1, activation_cot)
         del activation_cot
-    memory_usage_snapshot(task_name)
 
   stack_mean = lambda x: jnp.mean(jnp.stack(x), axis=(0, 1))
   loss = stack_mean(loss)

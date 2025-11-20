@@ -1044,15 +1044,16 @@ def set_and_validate_pipeline_config(raw_keys):
             logical_axis_rules[idx] = [name, new_axes]
         
         else:
-          if logical_rule[0] == "activation_embed_and_logits_batch":
+          if (logical_rule[0] == "activation_embed_and_logits_batch" or 
+              logical_rule[0] == "activation_embed_and_logits_batch_outside_vmap"):
             # For pipeline parallelism the pre and post decoder layer tensors' batch dimension is sharded by stages.
             # Microbatches are sharded by stage, so moving out of and into this sharding should be a local reshape.
             # The "stage" needs to be listed first since the microbatch dimension is first before the reshape.
             logical_axis_rules[idx] = [
-                "activation_embed_and_logits_batch",
+                logical_rule[0],
                 ["stage", "data", "fsdp", "fsdp_transpose", "expert"],
             ]
-            break  # Exit the loop after modifying the list
+
       return logical_axis_rules
 
     def pipeline_first_axis(raw_keys):

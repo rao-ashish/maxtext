@@ -57,9 +57,108 @@ class ExperimentConfig:
 # ---- Configured experiments. ---- #
 
 EXPERIMENTS = [
-    # ---- MPMD multi-process experiments ---- #
+    # ---- SPMD multi-process (4) experiments ---- #
     # ExperimentConfig(
-    #     name="mmpp-mpmd-mifc_256-num_repeats_1-multiprocess",
+    #     name="mmpp-spmd-mifc_256-num_repeats_1-multiprocess_4",
+    #     overrides={
+    #         "num_layers_per_pipeline_stage": 4,
+    #         "use_mmpp": False,
+    #     },
+    #     is_multiprocess=True,
+    #     multiprocess_kwargs={
+    #         "num_processes": 4,
+    #         "devices_per_process": 2,
+    #     },
+    # ),
+    # ExperimentConfig(
+    #     name="mmpp-spmd-mifc_256-num_repeats_2-multiprocess_4",
+    #     overrides={
+    #         "num_layers_per_pipeline_stage": 2,
+    #         "use_mmpp": False,
+    #     },
+    #     is_multiprocess=True,
+    #     multiprocess_kwargs={
+    #         "num_processes": 4,
+    #         "devices_per_process": 2,
+    #     },
+    # ),
+    # ExperimentConfig(
+    #     name="mmpp-spmd-mifc_256-num_repeats_4-multiprocess_4",
+    #     overrides={
+    #         "num_layers_per_pipeline_stage": 1,
+    #         "use_mmpp": False,
+    #     },
+    #     is_multiprocess=True,
+    #     multiprocess_kwargs={
+    #         "num_processes": 4,
+    #         "devices_per_process": 2,
+    #     },
+    # ),
+    # ---- MPMD multi-process (8) experiments ---- #
+    # ExperimentConfig(
+    #     name="mmpp-spmd-mifc_256-num_repeats_1-multiprocess_8",
+    #     overrides={
+    #         "num_layers_per_pipeline_stage": 4,
+    #         "use_mmpp": False,
+    #     },
+    #     is_multiprocess=True,
+    #     multiprocess_kwargs={
+    #         "num_processes": 8,
+    #         "devices_per_process": 1,
+    #     },
+    # ),
+    ExperimentConfig(
+        name="mmpp-spmd-mifc_256-num_repeats_2-multiprocess_8",
+        overrides={
+            "num_layers_per_pipeline_stage": 2,
+            "use_mmpp": False,
+        },
+        is_multiprocess=True,
+        multiprocess_kwargs={
+            "num_processes": 8,
+            "devices_per_process": 1,
+        },
+    ),
+    ExperimentConfig(
+        name="mmpp-spmd-mifc_256-num_repeats_4-multiprocess_8",
+        overrides={
+            "num_layers_per_pipeline_stage": 1,
+            "use_mmpp": False,
+        },
+        is_multiprocess=True,
+        multiprocess_kwargs={
+            "num_processes": 8,
+            "devices_per_process": 1,
+        },
+    ),
+    # # ---- MPMD single-process experiments ---- #
+    # ExperimentConfig(
+    #     name="mmpp-mpmd-mifc_256-num_repeats_1",
+    #     overrides={
+    #         "num_layers_per_pipeline_stage": 4,
+    #         "use_mmpp": True,
+    #     },
+    #     is_multiprocess=False,
+    # ),
+    # ExperimentConfig(
+    #     name="mmpp-mpmd-mifc_256-num_repeats_2",
+    #     overrides={
+    #         "num_layers_per_pipeline_stage": 2,
+    #         "use_mmpp": True,
+    #     },
+    #     is_multiprocess=False,
+    # ),
+    # ExperimentConfig(
+    #     name="mmpp-mpmd-mifc_256-num_repeats_4",
+    #     overrides={
+    #         "num_layers_per_pipeline_stage": 1,
+    #         "use_mmpp": True,
+    #     },
+    #     is_multiprocess=False,
+    # ),
+    # # ---- MPMD multi-process (4) experiments ---- #
+    # ExperimentConfig(
+    #     name="mmpp-mpmd-mifc_256-num_repeats_1-multiprocess_4",
     #     overrides={
     #         "num_layers_per_pipeline_stage": 4,
     #         "use_mmpp": True,
@@ -70,28 +169,65 @@ EXPERIMENTS = [
     #         "devices_per_process": 2,
     #     },
     # ),
-    ExperimentConfig(
-        name="mmpp-mpmd-mifc_256-num_repeats_2-multiprocess",
-        overrides={
-            "num_layers_per_pipeline_stage": 2,
-            "use_mmpp": True,
-        },
-        is_multiprocess=True,
-        multiprocess_kwargs={
-            "num_processes": 4,
-            "devices_per_process": 2,
-        },
-    ),
-    ExperimentConfig(
-        name="mmpp-mpmd-mifc_256-num_repeats_4-multiprocess",
-        overrides={
-            "num_layers_per_pipeline_stage": 1,
-            "use_mmpp": True,
-        },
-        is_multiprocess=True,
-        multiprocess_kwargs={
-            "num_processes": 4,
-            "devices_per_process": 2,
-        },
-    ),
+    # ExperimentConfig(
+    #     name="mmpp-mpmd-mifc_256-num_repeats_2-multiprocess_4",
+    #     overrides={
+    #         "num_layers_per_pipeline_stage": 2,
+    #         "use_mmpp": True,
+    #     },
+    #     is_multiprocess=True,
+    #     multiprocess_kwargs={
+    #         "num_processes": 4,
+    #         "devices_per_process": 2,
+    #     },
+    # ),
+    # ExperimentConfig(
+    #     name="mmpp-mpmd-mifc_256-num_repeats_4-multiprocess_4",
+    #     overrides={
+    #         "num_layers_per_pipeline_stage": 1,
+    #         "use_mmpp": True,
+    #     },
+    #     is_multiprocess=True,
+    #     multiprocess_kwargs={
+    #         "num_processes": 4,
+    #         "devices_per_process": 2,
+    #     },
+    # ),
+    # # ---- MPMD multi-process (8) experiments ---- #
+    # ExperimentConfig(
+    #     name="mmpp-mpmd-mifc_256-num_repeats_1-multiprocess_8",
+    #     overrides={
+    #         "num_layers_per_pipeline_stage": 4,
+    #         "use_mmpp": True,
+    #     },
+    #     is_multiprocess=True,
+    #     multiprocess_kwargs={
+    #         "num_processes": 8,
+    #         "devices_per_process": 1,
+    #     },
+    # ),
+    # ExperimentConfig(
+    #     name="mmpp-mpmd-mifc_256-num_repeats_2-multiprocess_8",
+    #     overrides={
+    #         "num_layers_per_pipeline_stage": 2,
+    #         "use_mmpp": True,
+    #     },
+    #     is_multiprocess=True,
+    #     multiprocess_kwargs={
+    #         "num_processes": 8,
+    #         "devices_per_process": 1,
+    #     },
+    # ),
+    # ExperimentConfig(
+    #     name="mmpp-mpmd-mifc_256-num_repeats_4-multiprocess_8",
+    #     overrides={
+    #         "num_layers_per_pipeline_stage": 1,
+    #         "use_mmpp": True,
+    #     },
+    #     is_multiprocess=True,
+    #     multiprocess_kwargs={
+    #         "num_processes": 8,
+    #         "devices_per_process": 1,
+    #     },
+    # ),
 ]
