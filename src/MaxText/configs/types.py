@@ -634,7 +634,7 @@ class HardwareAndMesh(BaseModel):
   )
   shard_mode: ShardMode = Field("auto", description="can be either auto or explicit")
   inhomogeneous_layer_cycle_interval: int = Field(1, description="The interval of repeated inhomogeneous layer patterns.")
-  scan_layers: bool = Field(True, description="Whether to use jax.lax.scan over layers.")
+  scan_layers: bool = Field(False, description="Whether to use jax.lax.scan over layers.")
   param_scan_axis: int = Field(1, description="Axis to scan over for parameters.")
   context_parallel_load_balance: bool = Field(True, description="Whether to use load balancing for context parallelism.")
   context_parallel_strategy: str = Field(
@@ -702,6 +702,8 @@ class IciParallelism(BaseModel):
 
 class PipelineParallelism(BaseModel):
   """Configuration for pipeline parallelism."""
+  use_mmpp: bool = Field(False, description="Whether to use experimental MPMD-style pipeline parallelism.")
+  mmpp_schedule: str = Field("gpipe", description="MMPP pipeline schedule: ['gpipe', '1F1B']")
 
   num_layers_per_pipeline_stage: int = Field(1, description="Number of layers to place on each pipeline stage.")
   num_pipeline_repeats: int = Field(
@@ -1803,10 +1805,24 @@ class MaxTextConfig(
         )
 
       # For AOT compilation and correctness, always prioritize the 'stage' axis for sharding when pipelining.
-      for rule in self.logical_axis_rules:
-        if rule and rule[0] == "activation_embed_and_logits_batch":
-          rule[1] = ["stage", "data", "fsdp", "fsdp_transpose", "expert"]
-          break
+      for rule_idx, rule in enumerate(self.logical_axis_rules):
+        if not rule:
+          continue
+        
+        if self.use_mmpp:
+          name, axes = rule
+          if "batch" in name:
+            # For mmpp we explicitly control the DP axis via vmap.
+            remove_axes = ("data", "stage")
+            if name == "activation_embed_and_logits_batch_outside_vmap":
+              remove_axes = ("stage",)
+            new_axes = [axis for axis in axes if axis not in remove_axes]
+            self.logical_axis_rules[rule_idx] = [name, new_axes]
+        
+        else:
+          if (rule[0] == "activation_embed_and_logits_batch" or
+              rule[0] == "activation_embed_and_logits_batch_outside_vmap"):
+            rule[1] = ["stage", "data", "fsdp", "fsdp_transpose", "expert"]
 
       if "stage" in self.mesh_axes:
         stage_idx = self.mesh_axes.index("stage")
@@ -1822,7 +1838,8 @@ class MaxTextConfig(
           and "stage" in self.data_sharding[0]
       ):
         self.data_sharding[0].remove("stage")
-        self.data_sharding[0].insert(0, "stage")
+        if not self.use_mmpp:
+          self.data_sharding[0].insert(0, "stage")
 
       # Add sharding for FP8 amax history when using pipeline parallelism.
       if self.quantization and "fp8" in self.quantization:

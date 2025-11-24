@@ -425,6 +425,8 @@ class Pipeline(nn.Module):
 
     def func_to_vmap(body_instance, stages_inputs, stages_segment_ids, stages_positions, deterministic, model_mode):
       """nn.vmap requires either a nn.module class or a function whose first argument is a nn.module instance."""
+      if isinstance(stages_inputs, tuple):
+        stages_inputs = stages_inputs[0]
       return body_instance(stages_inputs, stages_segment_ids, stages_positions, deterministic, model_mode)
 
     vmap_func = nn.vmap(
@@ -463,6 +465,8 @@ class Pipeline(nn.Module):
               "x_times": self.num_stages,
           },
       )
+      if isinstance(stages_inputs, tuple):
+        stages_inputs = stages_inputs[0]
       return body_instance.apply(weights, stages_inputs, stages_segment_ids, stages_positions, deterministic, model_mode)
 
     vmap_func = nn.vmap(
@@ -544,7 +548,7 @@ class Pipeline(nn.Module):
         deterministic,
         model_mode,
     )
-    if self.config.scan_layers:
+    if isinstance(stages_output, tuple):
       stages_output = stages_output[0]
 
     new_state = self.get_new_loop_state(stages_output, loop_state)
@@ -734,7 +738,7 @@ class Pipeline(nn.Module):
       stage_outputs = vmap_func(
           self.layers, example_inputs, example_segmentation, example_position, deterministic, model_mode
       )
-      if self.config.scan_layers:
+      if isinstance(stage_outputs, tuple):
         stage_outputs = stage_outputs[0]
 
       # We return something of the correct shape (global_batch, sequence, embed) by reshaping a single stages output
