@@ -239,9 +239,10 @@ class SequentialBlockDecoderLayers(nn.Module):
       model_mode,
       slot: None | int = None,
       page_state: None | page_manager.PageState = None,
+      kv_caches: list[jax.Array] | None = None,
   ) -> jnp.ndarray:
     for lyr in range(self.num_decoder_layers):
-      inputs = self.decoder_layer(
+      inputs, kv_cache = self.decoder_layer(
           config=self.config, mesh=self.mesh, name=f"layers_{lyr}", quant=self.quant, model_mode=model_mode
       )(
           inputs,
@@ -251,13 +252,11 @@ class SequentialBlockDecoderLayers(nn.Module):
           model_mode,
           slot=slot,
           page_state=page_state,
+          kv_cache=None if kv_caches is None else kv_caches[lyr]
       )
-      if self.config.scan_layers:
-        inputs = inputs[0]  #  When scan_layers is True the decoder layers return (outputs, None).
-    if self.config.scan_layers:
-      return inputs, None  # pytype: disable=bad-return-type
-    else:
-      return inputs
+      if kv_caches is not None:
+        kv_caches[lyr] = kv_cache
+    return inputs, kv_caches
 
 
 class Decoder(nn.Module):
