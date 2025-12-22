@@ -73,6 +73,9 @@ from MaxText.vocabulary_tiling import vocab_tiling_linen_loss
 from MaxText.dpo_utils import _merge_dpo_state, _split_dpo_state, dpo_loss_fn
 from MaxText.train_utils import validate_train_config
 from MaxText.metric_logger import record_activation_metrics
+
+from MaxText.mmpp.mpmd import get_jaxpr, get_unoptimized_stable_hlo, get_optimized_hlo
+
 # pylint: disable=too-many-positional-arguments
 
 
@@ -459,15 +462,30 @@ def train_loop(config, recorder, state=None):
       state_to_save = state if not config.use_dpo else _split_dpo_state(state)[0]
       checkpointing.maybe_save_checkpoint(checkpoint_manager, state_to_save, config, data_iterator, step)
 
-      if config.dump_hlo and step == (config.dump_step if config.dump_step >= 0 else start_step):
-        jax.block_until_ready(state)  # Ensure compilation has finished.
-        gcs_utils.upload_dump(
-            config.dump_hlo_local_dir,
-            config.dump_hlo_gcs_dir,
-            module_name=config.dump_hlo_module_name,
-            delete_local_after=config.dump_hlo_delete_local_after,
-            all_host_upload=config.dump_hlo_upload_all,
-        )
+      if not config.use_mmpp and step == start_step:
+        # Ensure compilation has finished.
+        jax.block_until_ready(state)
+        # Dump the IR's.
+        os.makedirs("scripts/outputs/ir_dump", exist_ok=True)
+        with open("scripts/outputs/ir_dump/jaxpr-train_step.txt", "w") as f:
+          jaxpr = get_jaxpr(p_train_step, state, example_batch, nextrng)
+          f.write(jaxpr)
+        with open("scripts/outputs/ir_dump/stable_hlo-train_step.txt", "w") as f:
+          stable_hlo = get_unoptimized_stable_hlo(p_train_step, state, example_batch, nextrng)
+          f.write(stable_hlo)
+        with open("scripts/outputs/ir_dump/optimized_hlo-train_step.txt", "w") as f:
+          optimized_hlo = get_optimized_hlo(p_train_step, state, example_batch, nextrng)
+          f.write(optimized_hlo)
+
+      # if config.dump_hlo and step == (config.dump_step if config.dump_step >= 0 else start_step):
+      #   jax.block_until_ready(state)  # Ensure compilation has finished.
+      #   gcs_utils.upload_dump(
+      #       config.dump_hlo_local_dir,
+      #       config.dump_hlo_gcs_dir,
+      #       module_name=config.dump_hlo_module_name,
+      #       delete_local_after=config.dump_hlo_delete_local_after,
+      #       all_host_upload=config.dump_hlo_upload_all,
+      #   )
 
       if config.eval_interval > 0 and step > start_step and (step + 1) % config.eval_interval == 0:
         assert eval_data_iterator

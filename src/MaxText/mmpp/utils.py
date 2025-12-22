@@ -23,7 +23,7 @@ libcudart = cdll.LoadLibrary("libcudart.so")
 import nvtx
 
 
-DUMMY_VJP_FUN = 123
+DUMMY_VJP_FUN = None
 
 
 ### vjp-related utilities
@@ -51,7 +51,7 @@ def fwd_and_bwd(
     f_partial, dyn_args = argnums_partial(f, argnums, args, require_static_args_hashable=False)
 
     # Take the vjp.
-    primals_out, vjp_fn, *rest = jax._src.api._vjp3(f_partial, *dyn_args, has_aux=has_aux)
+    primals_out, vjp_fn, *rest = jax._src.api._vjp(f_partial, *dyn_args, has_aux=has_aux)
 
     # vjp_fn.args_res contains the saved arguments. vjp_fn.opaque_residuals
     # contains saved activations for the backward pass.
