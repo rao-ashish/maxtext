@@ -1,11 +1,10 @@
 #!/usr/bin/bash
 PROFILE_CMD=""
-# PROFILE_CMD="nsys profile --output scripts/outputs/profiles/OPTIMIZED-mmpp-mpmd-mifc_256-num_repeats_2-L40Sx8.nsys-rep --cpuctxsw=none --trace=cublas,cuda,cudnn,cusolver,nvtx,osrt,python-gil --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop --cuda-graph-trace=node --python-sampling=true"
+# PROFILE_CMD="nsys profile --output scripts/outputs/profiles/REMAT_LAST-DONT_DONATE_GRADS_ACC_LAST-mpmd-gpipe-mifc_256-num_repeats_1.nsys-rep --cpuctxsw=none --trace=cublas,cuda,cudnn,cusolver,nvtx,osrt,python-gil --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop --cuda-graph-trace=node --python-sampling=true"
 
 export XLA_FLAGS="--xla_disable_hlo_passes=rematerialization"
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.90
 export NVTE_FUSED_ATTN=1
-export JAX_COMPILATION_CACHE_DIR="/tmp/jax_cache"
 
 $PROFILE_CMD python3 -m MaxText.train MaxText/configs/base.yml \
     run_name=logdir \
@@ -33,7 +32,8 @@ $PROFILE_CMD python3 -m MaxText.train MaxText/configs/base.yml \
     attention=cudnn_flash_te \
     num_layers_per_pipeline_stage=4 \
     use_mmpp=true \
-    mmpp_schedule=1F1B \
+    mmpp_schedule=gpipe \
     profiler=nsys \
     skip_first_n_steps_for_profiler=10 \
-    profiler_steps=9
+    profiler_steps=9 \
+    scan_layers=false

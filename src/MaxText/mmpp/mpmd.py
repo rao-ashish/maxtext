@@ -18,6 +18,7 @@ from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 
 from flax.linen import partitioning as nn_partitioning
 
+import MaxText.mmpp.utils as utils
 
 def slice_mesh(mesh, axis_name, slice_index):
   axis = mesh.axis_names.index(axis_name)
@@ -320,6 +321,31 @@ def transform(
     in_shardings = adjust_to_stage_mesh(stage_mesh, section_in_shardings[section_name])
     out_shardings = adjust_to_stage_mesh(stage_mesh, section_out_shardings[section_name])
     section_fn.__name__ = f"section_{section_kind.name}{stage_index}"
+    
+    # # HACK: We never enforce in_shardings, and only enforce out_shardings when
+    # # we want to make sure that forward outputs have leading dimensioned sharded
+    # # over the 'data' mesh axis.
+    # in_shardings = None
+    # if section_name[0] == SectionKind.Forward:
+    #   def fix_sharding(sharding):
+    #     assert isinstance(sharding, NamedSharding)
+    #     partitions = tuple(p for p in sharding.spec)
+    #     if len(partitions) == 0:
+    #       partitions = ("data",)
+    #     else:
+    #       utils.tuple_update(partitions, 0, "data")
+    #     new_spec = sharding.spec.update(
+    #       partitions=partitions
+    #     )
+    #     return NamedSharding(sharding.mesh, new_spec)
+
+    #   out_shardings = jax.tree.map(
+    #     fix_sharding, out_shardings,
+    #     is_leaf=lambda x: isinstance(x, NamedSharding)
+    #   )
+    # else:
+    #   out_shardings = None
+    
     jitted_section_fn = jax.jit(
         section_fn,
         in_shardings=in_shardings,
@@ -327,6 +353,8 @@ def transform(
         static_argnums=static_argnums,
         donate_argnums=donate_argnums,
     )
+
+
     @wraps(jitted_section_fn)
     def apply_stage(*args):
       check_args_mesh(section_name, stage_mesh, args)

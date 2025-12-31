@@ -402,7 +402,7 @@ def value_and_grad(
   bwd_fns = [
     ctx.section(
           (mpmd.SectionKind.Backward, stage_idx),
-          donate_argnums=(0,1,2,3),
+          donate_argnums=(0,1,2,3) if stage_idx != num_logical_stages - 1 else (0,1,2,),
     )
     for stage_idx in range(num_logical_stages)
   ]

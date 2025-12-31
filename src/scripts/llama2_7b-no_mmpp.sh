@@ -30,8 +30,9 @@ $PROFILE_CMD python3 -m MaxText.train MaxText/configs/base.yml \
     remat_policy=minimal_with_context \
     gradient_clipping_threshold=0 \
     attention=cudnn_flash_te \
-    num_layers_per_pipeline_stage=1 \
+    num_layers_per_pipeline_stage=4 \
     use_mmpp=false \
     profiler=nsys \
     skip_first_n_steps_for_profiler=4 \
-    profiler_steps=5
+    profiler_steps=5 \
+    scan_layers=false

@@ -185,14 +185,22 @@ class Transformer(nn.Module):
 
     num_layers_per_stage += 1 if stage_index < rem else 0
     layer_module = self.decoder_layer
-    if stage_index != self.num_logical_stages - 1:
-      # Remat all but the last stage
-      layer_module = nn.remat(
-          layer_module,
-          prevent_cse=not cfg.scan_layers_per_stage,
-          policy=models.Decoder.get_remat_policy(cfg),
-          static_argnums=(4, 5),  # Deterministic and model mode are static arguments.
-      )
+
+    layer_module = nn.remat(
+        layer_module,
+        prevent_cse=not cfg.scan_layers_per_stage,
+        policy=models.Decoder.get_remat_policy(cfg),
+        static_argnums=(4, 5),  # Deterministic and model mode are static arguments.
+    )
+    
+    # if stage_index != self.num_logical_stages - 1:
+    #   # Remat all but the last stage
+    #   layer_module = nn.remat(
+    #       layer_module,
+    #       prevent_cse=not cfg.scan_layers_per_stage,
+    #       policy=models.Decoder.get_remat_policy(cfg),
+    #       static_argnums=(4, 5),  # Deterministic and model mode are static arguments.
+    #   )
     stage_module = self.get_pipeline_stage_module(
         stage_index,
         layer_module,
