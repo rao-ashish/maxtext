@@ -43,13 +43,13 @@ def model_fwd_and_bwd(model, stage_index):
   # TODO: Pass spmd_axis="data" to vmap?
   fwd = jax.vmap(
     fwd,
-    in_axes=(None, 0, 0, None),  # params, acts, data, rng
+    in_axes=(0, 0, 0, None),  # params, acts, data, rng
     out_axes=0,                  # acts, stashed, aux?
     spmd_axis_name="data",
   )
   bwd = jax.vmap(
     bwd,
-    in_axes=(0, 0, None),        # stashed, out_cot, params
+    in_axes=(0, 0, 0),        # stashed, out_cot, params
     out_axes=0,                  # grads, in_cot
     spmd_axis_name="data",
   )
@@ -68,10 +68,10 @@ def make_init_stage(num_mubatches, dp_factor, params, stage_index):
   # NB: We compute param_infos outside init_stage, so it doesn't capture params!
   def make_param_info(p):
     # DP-vmap-trick: prepend DP dimension to grads_acc
-    shape = (dp_factor,) + p.shape
-    spec = PartitionSpec("data", *p.sharding.spec)
-    sharding = NamedSharding(p.sharding.mesh, spec)
-    return ParamInfo(shape, p.dtype, sharding)
+    # shape = (dp_factor,) + p.shape
+    # spec = PartitionSpec("data", *p.sharding.spec)
+    # sharding = NamedSharding(p.sharding.mesh, spec)
+    return ParamInfo(p.shape, p.dtype, p.sharding)
 
   param_infos = jax.tree.map(make_param_info, params)
 
@@ -102,10 +102,26 @@ def make_init_stage(num_mubatches, dp_factor, params, stage_index):
   return init_stage
 
 
-def fwd_stage(fwd, params, input_activations, data, rng, mubatch_idx):
+def fwd_stage(fwd, stage_idx, params, input_activations, data, rng, mubatch_idx):
+
+  print(f"Inside fwd_stage {stage_idx}, input params sharding is")
+  print(jax.typeof(jax.tree.flatten(params)[0][0]).sharding.spec)
+  print(jax.typeof(jax.tree.flatten(params)[0][1]).sharding.spec)
+  print(jax.typeof(jax.tree.flatten(params)[0][2]).sharding.spec)
+  print(jax.typeof(jax.tree.flatten(params)[0][3]).sharding.spec)
+  print()
+
   # Slice out the microbatch
   mubatch_data = jax.tree.map(lambda x: x[mubatch_idx], data)
   res = fwd(params, input_activations, mubatch_data, rng)
+  
+  print(f"At end of fwd_stage {stage_idx}, input params sharding is")
+  print(jax.typeof(jax.tree.flatten(params)[0][0]).sharding.spec)
+  print(jax.typeof(jax.tree.flatten(params)[0][1]).sharding.spec)
+  print(jax.typeof(jax.tree.flatten(params)[0][2]).sharding.spec)
+  print(jax.typeof(jax.tree.flatten(params)[0][3]).sharding.spec)
+  print()
+  
   return params, *res
 
 
@@ -115,14 +131,52 @@ def bwd_stage(bwd, params, stashed, out_cot, grads_acc):
   return params, grads_acc, in_cot
 
 
-def update_stage_state(tx, params, opt_state, grads):
+
+def make_update_stage_state_fn(tx, params, opt_state, grads, stage_mesh):
+
+  all_ios = (params, opt_state, grads)
+  io_specs = jax.tree.map(lambda x: jax.typeof(x).sharding.spec, all_ios)
+
+  print("IN make_update_stage_state_fn, params info in io_specs")
+  print(jax.tree.flatten(io_specs)[0][0])
+  print(jax.tree.flatten(io_specs)[0][1])
+  print(jax.tree.flatten(io_specs)[0][2])
+
+  @partial(jax.shard_map,
+    in_specs=io_specs,
+    out_specs=io_specs,
+    axis_names={"data"},
+    mesh=stage_mesh)
+  def shard_mapped_update(ps, os, gs):
+    reduced_grads = jax.lax.psum(gs, axis_name="data")
+    updates, new_opt_state = tx.update(reduced_grads, os, ps)
+    new_params = optax.apply_updates(ps, updates)
+    return new_params, new_opt_state, reduced_grads
+  
+  return shard_mapped_update
+
+
+def update_stage_state(tx, stage_idx, params, opt_state, grads):
   # No OWG: https://github.com/google/flax/blob/240a5107c02d60c171098fbc3f2738d8b6f5ba75/flax/training/train_state.py#L108-L110
   assert nn.fp8_ops.OVERWRITE_WITH_GRADIENT not in grads
   # DP-vmap-trick: explicitly reduce across DP axis
-  grads = jax.tree.map(lambda x: jnp.sum(x, axis=0), grads)
-  updates, new_opt_state = tx.update(grads, opt_state, params)
-  new_params = optax.apply_updates(params, updates)
-  return new_params, new_opt_state
+
+  ctx = mpmd.get_context()
+  if ctx.tracing_for_inference:
+    return params, opt_state, grads
+
+  update_fn = make_update_stage_state_fn(tx, params, opt_state, grads, ctx.get_stage_mesh(stage_idx))
+  out = update_fn(params, opt_state, grads)
+
+  all_ios = (params, opt_state, grads)
+  io_specs = jax.tree.map(lambda x: jax.typeof(x).sharding.spec, all_ios)
+
+  print("AFTER update_stage_state, params info in io_specs")
+  print(jax.tree.flatten(io_specs)[0][0])
+  print(jax.tree.flatten(io_specs)[0][1])
+  print(jax.tree.flatten(io_specs)[0][2])
+
+  return out
 
 
 def get_section_fns(model, state_by_stage) -> dict[mpmd.SectionName, Callable]:
@@ -133,9 +187,9 @@ def get_section_fns(model, state_by_stage) -> dict[mpmd.SectionName, Callable]:
     init_stage = make_init_stage(num_mubatches, dp_factor, state.params, stage_index)
     fwd, bwd = model_fwd_and_bwd(model, stage_index)
     section_fns[(mpmd.SectionKind.Prologue, stage_index)] = init_stage
-    section_fns[(mpmd.SectionKind.Forward, stage_index)] = partial(fwd_stage, fwd)
+    section_fns[(mpmd.SectionKind.Forward, stage_index)] = partial(fwd_stage, fwd, stage_index)
     section_fns[(mpmd.SectionKind.Backward, stage_index)] = partial(bwd_stage, bwd)
-    section_fns[(mpmd.SectionKind.Epilogue, stage_index)] = partial(update_stage_state, state.tx)
+    section_fns[(mpmd.SectionKind.Epilogue, stage_index)] = partial(update_stage_state, state.tx, stage_index)
   return section_fns
 
 
@@ -215,18 +269,6 @@ def split_params_by_stage(num_stages, all_params):
   return tuple(params_by_stage)
 
 
-# def split_opt_state_by_stage(num_stages, opt_state):
-#   # Assumption: Optimizer state consists of mu and nu.
-#   # https://flax-linen.readthedocs.io/en/latest/guides/model_inspection/model_surgery.html#surgery-with-optimizers
-#   mu_by_stage = split_params_by_stage(num_stages, opt_state[0].mu)
-#   nu_by_stage = split_params_by_stage(num_stages, opt_state[0].nu)
-
-#   opt_state_by_stage = [
-#     utils.tuple_update(opt_state, 0, opt_state[0]._replace(mu=mu, nu=nu, step=))
-#     for mu, nu in zip(mu_by_stage, nu_by_stage)
-#   ]
-#   return tuple(opt_state_by_stage)
-
 def split_opt_state_by_stage(num_stages, opt_state):
   mu_by_stage = split_params_by_stage(num_stages, opt_state[0].mu)
   nu_by_stage = split_params_by_stage(num_stages, opt_state[0].nu)
@@ -251,16 +293,27 @@ def split_opt_state_by_stage(num_stages, opt_state):
 def split_state_by_stage(num_logical_stages, num_physical_stages, state):
   params_by_stage = split_params_by_stage(num_logical_stages, state.params)
   opt_state_by_stage = split_opt_state_by_stage(num_logical_stages, state.opt_state)
-  return tuple(
+  
+  params_by_stage = tuple(
     jax.tree.map(
-      lambda x: remove_mesh_axis(x, "stage", stage_idx % num_physical_stages),
-      state.replace(step=state.step, params=params, opt_state=opt_state),
+      lambda x: remove_mesh_axis(x, "stage", stage_idx % num_physical_stages), params
     )
+    for stage_idx, params in enumerate(params_by_stage)
+  )
+
+  opt_state_by_stage = tuple(
+    jax.tree.map(
+      lambda x: remove_mesh_axis(x, "stage", stage_idx % num_physical_stages), opt_state
+    )
+    for stage_idx, opt_state in enumerate(opt_state_by_stage)
+  )
+
+  return tuple(
+    state.replace(step=state.step, params=params, opt_state=opt_state)
     for stage_idx, (params, opt_state) in enumerate(
       zip(params_by_stage, opt_state_by_stage, strict=True)
     )
   )
-
 
 # update_state is the stage-sharded equivalent of
 #   new_state = old_state.apply_gradients(grads=grads)
@@ -277,7 +330,7 @@ def update_state(ctx, old_state_by_stage, grads_by_stage):
     _update_stage_state = ctx.section((mpmd.SectionKind.Epilogue, stage_index),
       donate_argnums=(0, 1, 2))
     with utils.annotate(f"update{stage_index}", color="green"):
-      new_params, new_opt_state = _update_stage_state(params, opt_state, grads)
+      new_params, new_opt_state, _ = _update_stage_state(params, opt_state, grads)
     new_state_by_stage.append(
       old_state.replace(
         step=old_state.step + 1,
@@ -291,19 +344,15 @@ def update_state(ctx, old_state_by_stage, grads_by_stage):
 ### Transfer state and input data to the corresponding stages' meshes
 
 
-def _constant(stage_idx, const, *, shape=(), spec=PartitionSpec()):
-  ctx = mpmd.get_context()
-  stage_mesh = ctx.get_stage_mesh(stage_idx)
-  sharding = NamedSharding(stage_mesh, spec)
-  arr = jnp.full(shape, const, device=sharding)
-  if ctx.tracing_for_inference:
-    return arr
-  return arr
-
-
 def constant(stage_idx, const, *, shape=(), spec=PartitionSpec()):
   with utils.annotate(f"const {stage_idx=} {const=} {shape=}", color="yellow"):
-    return _constant(stage_idx, const, shape=shape, spec=spec)
+    ctx = mpmd.get_context()
+    stage_mesh = ctx.get_stage_mesh(stage_idx)
+    sharding = NamedSharding(stage_mesh, spec)
+    arr = jnp.full(shape, const, device=sharding)
+    if ctx.tracing_for_inference:
+      return arr
+    return arr
 
 
 def transfer(stage_idx, xs):
@@ -319,6 +368,46 @@ def transfer(stage_idx, xs):
   return jax.tree.map(transfer_one, xs)
 
 
+def setup_state_for_dp(state_by_stage):
+  params_by_stage = tuple(s.params for s in state_by_stage)
+  opt_state_by_stage = tuple(s.opt_state for s in state_by_stage)
+
+  @jax.jit
+  def broadcast_and_shard_array(x):
+    if not isinstance(x, jax.Array):
+      return x
+    x_shape = x.shape
+    x_sharding = jax.typeof(x).sharding
+    x = jnp.broadcast_to(jnp.expand_dims(x, 0), (x_sharding.mesh.shape["data"], *x_shape))
+    new_sharding = NamedSharding(x_sharding.mesh, PartitionSpec("data", *x_sharding.spec))
+    return jax.lax.with_sharding_constraint(x, new_sharding)
+  
+  def broadcast_and_shard(x):
+    if isinstance(x, jax.NamedSharding):
+      return NamedSharding(x.mesh, PartitionSpec("data", *x.spec))
+    assert isinstance(x, jax.Array)
+    return broadcast_and_shard_array(x)
+
+  params_by_stage = jax.tree.map(broadcast_and_shard, params_by_stage)
+
+  opt_state_by_stage = (
+    utils.tuple_update(
+      opt_state, 0,
+      opt_state[0]._replace(
+        mu=jax.tree.map(broadcast_and_shard, opt_state[0].mu),
+        nu=jax.tree.map(broadcast_and_shard, opt_state[0].nu),
+      )
+    ) for opt_state in opt_state_by_stage
+  )
+
+  return tuple(
+    stage_state.replace(step=stage_state.step, params=params, opt_state=opt_state)
+    for stage_idx, (params, opt_state, stage_state) in enumerate(
+      zip(params_by_stage, opt_state_by_stage, state_by_stage, strict=True)
+    )
+  )
+
+
 def split_and_transfer_state(
   mesh, num_logical_stages, num_physical_stages, state, in_shard_train, out_shard_train
 ):
@@ -328,14 +417,67 @@ def split_and_transfer_state(
     state_by_stage = tuple(
       transfer(stage_idx, state) for stage_idx, state in enumerate(state_by_stage)
     )
+  state_by_stage = setup_state_for_dp(state_by_stage)
 
   assert in_shard_train[0] == out_shard_train[0]
   assert isinstance(in_shard_train[0], train_state.TrainState)
   state_shard_by_stage = split_state_by_stage(
     num_logical_stages, num_physical_stages, in_shard_train[0]
   )
+  state_shard_by_stage = setup_state_for_dp(state_shard_by_stage)
+
   in_shard_train = (state_shard_by_stage,) + in_shard_train[1:]
   out_shard_train = (state_shard_by_stage,) + out_shard_train[1:]
+
+  print("FIRST PARAM INFO AFTER SPLIT_AND_TRANSFER_STATE")
+  print(
+    jax.tree.flatten(state_by_stage)[0][0].shape,
+    jax.tree.flatten(state_by_stage)[0][0].sharding.spec,
+  )
+  print(
+    jax.tree.flatten(state_by_stage)[0][1].shape,
+    jax.tree.flatten(state_by_stage)[0][1].sharding.spec,
+  )
+  print(
+    jax.tree.flatten(state_by_stage)[0][2].shape,
+    jax.tree.flatten(state_by_stage)[0][2].sharding.spec,
+  )
+  print(
+    jax.tree.flatten(state_by_stage)[0][3].shape,
+    jax.tree.flatten(state_by_stage)[0][3].sharding.spec,
+  )
+  print()
+
+  print("in_shard_train AFTER SPLIT_AND_TRANSFER_STATE")
+  print(
+    jax.tree.flatten(in_shard_train)[0][0].spec
+  )
+  print(
+    jax.tree.flatten(in_shard_train)[0][1].spec
+  )
+  print(
+    jax.tree.flatten(in_shard_train)[0][2].spec
+  )
+  print(
+    jax.tree.flatten(in_shard_train)[0][3].spec
+  )
+  print()
+
+  print("out_shard_train AFTER SPLIT_AND_TRANSFER_STATE")
+  print(
+    jax.tree.flatten(out_shard_train)[0][0].spec
+  )
+  print(
+    jax.tree.flatten(out_shard_train)[0][1].spec
+  )
+  print(
+    jax.tree.flatten(out_shard_train)[0][2].spec
+  )
+  print(
+    jax.tree.flatten(out_shard_train)[0][3].spec
+  )
+  print()
+
 
   return state_by_stage, in_shard_train, out_shard_train
 

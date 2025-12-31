@@ -184,39 +184,19 @@ class Transformer(nn.Module):
     assert 0 <= stage_index < self.num_logical_stages
 
     num_layers_per_stage += 1 if stage_index < rem else 0
-    layer_module = self.decoder_layer
 
     layer_module = nn.remat(
-        layer_module,
+        self.decoder_layer,
         prevent_cse=not cfg.scan_layers_per_stage,
         policy=models.Decoder.get_remat_policy(cfg),
         static_argnums=(4, 5),  # Deterministic and model mode are static arguments.
     )
     
-    # if stage_index != self.num_logical_stages - 1:
-    #   # Remat all but the last stage
-    #   layer_module = nn.remat(
-    #       layer_module,
-    #       prevent_cse=not cfg.scan_layers_per_stage,
-    #       policy=models.Decoder.get_remat_policy(cfg),
-    #       static_argnums=(4, 5),  # Deterministic and model mode are static arguments.
-    #   )
     stage_module = self.get_pipeline_stage_module(
         stage_index,
         layer_module,
         num_layers_per_stage,
     )
-
-    # print(f"==== STAGE {stage_index} ====")
-    # print(f"input y is None: {y is None}")
-    # try:
-    #   print(f"input y flat span: {y.reshape(-1,1)[0:10, 0]}")
-    # except Exception as e:
-    #   print(f"input y is NOT an array, it is: {y}")
-    # print(f"decoder_segment_ids is None: {decoder_segment_ids is None}")
-    # print(f"decoder_positions is None: {decoder_positions is None}")
-    # print(f"deterministic: {deterministic}")
-    # print(f"model_mode: {model_mode}")
 
     y = stage_module(
       y,
@@ -231,8 +211,6 @@ class Transformer(nn.Module):
     ## If last stage: logits
     if stage_index == self.num_logical_stages - 1:
       y = self._logits(y, deterministic)
-    
-    # print(f"output y is None: {y is None}")
 
     return y
 

@@ -252,10 +252,60 @@ def transform(
     example_batch,
     init_rng,
     axis_rules,
-    print_inferred_shardings=False,
+    print_inferred_shardings=True,
 ):
   # Phase 1: Infer shardings
   print("PHASE1")
+
+  print("FIRST PARAM INFO START MPMD.TRANSFORM")
+  print(
+    jax.tree.flatten(state)[0][0].shape,
+    jax.tree.flatten(state)[0][0].sharding.spec,
+  )
+  print(
+    jax.tree.flatten(state)[0][1].shape,
+    jax.tree.flatten(state)[0][1].sharding.spec,
+  )
+  print(
+    jax.tree.flatten(state)[0][2].shape,
+    jax.tree.flatten(state)[0][2].sharding.spec,
+  )
+  print(
+    jax.tree.flatten(state)[0][3].shape,
+    jax.tree.flatten(state)[0][3].sharding.spec,
+  )
+  print()
+
+  print("step_in_shardings START MPMD.TRANSFORM")
+  print(
+    jax.tree.flatten(step_in_shardings)[0][0].spec
+  )
+  print(
+    jax.tree.flatten(step_in_shardings)[0][1].spec
+  )
+  print(
+    jax.tree.flatten(step_in_shardings)[0][2].spec
+  )
+  print(
+    jax.tree.flatten(step_in_shardings)[0][3].spec
+  )
+  print()
+
+  print("step_out_shardings START MPMD.TRANSFORM")
+  print(
+    jax.tree.flatten(step_out_shardings)[0][0].spec
+  )
+  print(
+    jax.tree.flatten(step_out_shardings)[0][1].spec
+  )
+  print(
+    jax.tree.flatten(step_out_shardings)[0][2].spec
+  )
+  print(
+    jax.tree.flatten(step_out_shardings)[0][3].spec
+  )
+  print()
+
 
   dump_shardings = sharding_extractor()
   in_shardings_thunk = {}
@@ -360,7 +410,7 @@ def transform(
       check_args_mesh(section_name, stage_mesh, args)
       with stage_mesh:
         if section_name not in compiled_section_fns:
-          # Dump the IR's.
+          # Dump the IRs.
           os.makedirs("scripts/outputs/ir_dump", exist_ok=True)
           with open(f"scripts/outputs/ir_dump/jaxpr-{section_fn.__name__}.txt", "w") as f:
             jaxpr = get_jaxpr(jitted_section_fn, *args)
@@ -371,7 +421,6 @@ def transform(
           with open(f"scripts/outputs/ir_dump/optimized_hlo-{section_fn.__name__}.txt", "w") as f:
             optimized_hlo = get_optimized_hlo(jitted_section_fn, *args)
             f.write(optimized_hlo)
-
 
           compiled_section_fns[section_name] = jitted_section_fn.lower(*args).compile()
         return compiled_section_fns[section_name](*args)
