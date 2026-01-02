@@ -43,13 +43,13 @@ def model_fwd_and_bwd(model, stage_index):
   # TODO: Pass spmd_axis="data" to vmap?
   fwd = jax.vmap(
     fwd,
-    in_axes=(None, 0, 0, None),  # params, acts, data, rng
+    in_axes=(0, 0, 0, None),  # params, acts, data, rng
     out_axes=0,                  # acts, stashed, aux?
     spmd_axis_name="data",
   )
   bwd = jax.vmap(
     bwd,
-    in_axes=(0, 0, None),        # stashed, out_cot, params
+    in_axes=(0, 0, 0),        # stashed, out_cot, params
     out_axes=0,                  # grads, in_cot
     spmd_axis_name="data",
   )
@@ -68,10 +68,7 @@ def make_init_stage(num_mubatches, dp_factor, params, stage_index):
   # NB: We compute param_infos outside init_stage, so it doesn't capture params!
   def make_param_info(p):
     # DP-vmap-trick: prepend DP dimension to grads_acc
-    shape = (dp_factor,) + p.shape
-    spec = PartitionSpec("data", *p.sharding.spec)
-    sharding = NamedSharding(p.sharding.mesh, spec)
-    return ParamInfo(shape, p.dtype, sharding)
+    return ParamInfo(p.shape, p.dtype, p.sharding)
 
   param_infos = jax.tree.map(make_param_info, params)
 
@@ -103,26 +100,50 @@ def make_init_stage(num_mubatches, dp_factor, params, stage_index):
 
 
 def fwd_stage(fwd, params, input_activations, data, rng, mubatch_idx):
-  # Slice out the microbatch
   mubatch_data = jax.tree.map(lambda x: x[mubatch_idx], data)
   res = fwd(params, input_activations, mubatch_data, rng)
   return params, *res
 
 
-def bwd_stage(bwd, params, stashed, out_cot, grads_acc):
+def bwd_stage(bwd, stage_idx, params, stashed, out_cot, grads_acc):
   grads, in_cot = bwd(stashed, out_cot, params)
   grads_acc = jax.tree.map(jnp.add, grads_acc, grads)
-  return params, grads_acc, in_cot
+  if stage_idx != 0:
+    return params, grads_acc, in_cot
+  return params, grads_acc
+
+def bwd_last_stage(bwd, update, params, stashed, out_cot, opt_state, grads_acc):
+  grads, in_cot = bwd(stashed, out_cot, params)
+  grads_acc = jax.tree.map(jnp.add, grads_acc, grads)
+  return update(params, opt_state, grads_acc)
 
 
-def update_stage_state(tx, params, opt_state, grads):
-  # No OWG: https://github.com/google/flax/blob/240a5107c02d60c171098fbc3f2738d8b6f5ba75/flax/training/train_state.py#L108-L110
-  assert nn.fp8_ops.OVERWRITE_WITH_GRADIENT not in grads
-  # DP-vmap-trick: explicitly reduce across DP axis
-  grads = jax.tree.map(lambda x: jnp.sum(x, axis=0), grads)
-  updates, new_opt_state = tx.update(grads, opt_state, params)
-  new_params = optax.apply_updates(params, updates)
-  return new_params, new_opt_state
+def make_update_stage(tx, stage_idx, stage_state):
+  params_specs = jax.tree.map(lambda x: x.sharding.spec, stage_state.params)
+  opt_state_specs = jax.tree.map(lambda x: x.sharding.spec, stage_state.opt_state)
+  grad_specs = params_specs
+  io_specs = (params_specs, opt_state_specs, grad_specs)
+
+  def update_stage(params, opt_state, grads):
+    stage_mesh = mpmd.get_context().get_stage_mesh(stage_idx)
+
+    @partial(jax.shard_map,
+      in_specs=io_specs,
+      out_specs=io_specs,
+      axis_names={"data"},
+      mesh=stage_mesh)
+    def shard_mapped_update(ps, os, gs):
+      # No OWG: https://github.com/google/flax/blob/240a5107c02d60c171098fbc3f2738d8b6f5ba75/flax/training/train_state.py#L108-L110
+      assert nn.fp8_ops.OVERWRITE_WITH_GRADIENT not in grads
+
+      reduced_grads = jax.lax.psum(gs, axis_name="data")
+      updates, new_opt_state = tx.update(reduced_grads, os, ps)
+      new_params = optax.apply_updates(ps, updates)
+      return new_params, new_opt_state, reduced_grads
+
+    return shard_mapped_update(params, opt_state, grads)
+  
+  return update_stage
 
 
 def get_section_fns(model, state_by_stage) -> dict[mpmd.SectionName, Callable]:
@@ -132,10 +153,15 @@ def get_section_fns(model, state_by_stage) -> dict[mpmd.SectionName, Callable]:
   for stage_index, state in enumerate(state_by_stage):
     init_stage = make_init_stage(num_mubatches, dp_factor, state.params, stage_index)
     fwd, bwd = model_fwd_and_bwd(model, stage_index)
+    update_stage = make_update_stage(state.tx, stage_index, state)
     section_fns[(mpmd.SectionKind.Prologue, stage_index)] = init_stage
     section_fns[(mpmd.SectionKind.Forward, stage_index)] = partial(fwd_stage, fwd)
-    section_fns[(mpmd.SectionKind.Backward, stage_index)] = partial(bwd_stage, bwd)
-    section_fns[(mpmd.SectionKind.Epilogue, stage_index)] = partial(update_stage_state, state.tx)
+    section_fns[(mpmd.SectionKind.Backward, stage_index)] = partial(bwd_stage, bwd, stage_index)
+    
+    if stage_index != 0:
+      section_fns[(mpmd.SectionKind.Epilogue, stage_index)] = update_stage
+    else:
+      section_fns[(mpmd.SectionKind.BackwardLast, stage_index)] = partial(bwd_last_stage, bwd, update_stage)
   return section_fns
 
 
@@ -273,11 +299,18 @@ def update_state(ctx, old_state_by_stage, grads_by_stage):
   new_state_by_stage = []
   for stage_index, (old_state, grads) in enumerate(
       zip(old_state_by_stage, grads_by_stage, strict=True)):
+
+    if stage_index == 0:
+      new_state_by_stage.append(old_state)
+      continue
+
     params, opt_state = old_state.params, old_state.opt_state
     _update_stage_state = ctx.section((mpmd.SectionKind.Epilogue, stage_index),
       donate_argnums=(0, 1, 2))
+    
     with utils.annotate(f"update{stage_index}", color="green"):
-      new_params, new_opt_state = _update_stage_state(params, opt_state, grads)
+      new_params, new_opt_state, _ = _update_stage_state(params, opt_state, grads)
+
     new_state_by_stage.append(
       old_state.replace(
         step=old_state.step + 1,
@@ -319,6 +352,61 @@ def transfer(stage_idx, xs):
   return jax.tree.map(transfer_one, xs)
 
 
+def setup_state_for_dp(state_by_stage):
+  params_by_stage = tuple(s.params for s in state_by_stage)
+  opt_state_by_stage = tuple(s.opt_state for s in state_by_stage)
+
+  # @partial(jax.jit, static_argnums=1)
+  def broadcast_and_shard_array(x, stage_index):
+    x_shape = x.shape
+    x_sharding = jax.typeof(x).sharding
+
+    x = jnp.broadcast_to(jnp.expand_dims(x, 0), (x_sharding.mesh.shape["data"], *x_shape))
+    new_sharding = NamedSharding(
+      mpmd.get_context().get_stage_mesh(stage_index),
+      PartitionSpec("data", *x_sharding.spec)
+    )
+    
+    out = jax.device_put(x, new_sharding)
+
+    return out
+  
+  def broadcast_and_shard(x, stage_index):
+    if isinstance(x, jax.NamedSharding):
+      return NamedSharding(x.mesh, PartitionSpec("data", *x.spec))
+    assert isinstance(x, jax.Array)
+    return broadcast_and_shard_array(x, stage_index)
+
+  new_stage_params = []
+  for stage_idx, stage_params in enumerate(params_by_stage):
+    print(f"broadcast_and_shard_array ON PARAMS {stage_idx}")
+    new_stage_params.append(
+      jax.tree.map(partial(broadcast_and_shard, stage_index=stage_idx), stage_params)
+    )
+  params_by_stage = tuple(new_stage_params)
+
+  opt_mus = []
+  opt_nus = []
+  for stage_idx, opt_state in enumerate(opt_state_by_stage):
+    print(f"broadcast_and_shard_array ON OPT_STATE {stage_idx}")
+    opt_mus.append(jax.tree.map(partial(broadcast_and_shard, stage_index=stage_idx), opt_state[0].mu))
+    opt_nus.append(jax.tree.map(partial(broadcast_and_shard, stage_index=stage_idx), opt_state[0].nu))
+  
+  opt_state_by_stage = tuple(
+    utils.tuple_update(
+      opt_state, 0,
+      opt_state[0]._replace(mu=opt_mus[stage_idx], nu=opt_nus[stage_idx])
+    ) for stage_idx, opt_state in enumerate(opt_state_by_stage)
+  )
+
+  return tuple(
+    stage_state.replace(step=stage_state.step, params=params, opt_state=opt_state)
+    for stage_idx, (params, opt_state, stage_state) in enumerate(
+      zip(params_by_stage, opt_state_by_stage, state_by_stage, strict=True)
+    )
+  )
+
+
 def split_and_transfer_state(
   mesh, num_logical_stages, num_physical_stages, state, in_shard_train, out_shard_train
 ):
@@ -328,12 +416,15 @@ def split_and_transfer_state(
     state_by_stage = tuple(
       transfer(stage_idx, state) for stage_idx, state in enumerate(state_by_stage)
     )
+    state_by_stage = setup_state_for_dp(state_by_stage)
 
   assert in_shard_train[0] == out_shard_train[0]
   assert isinstance(in_shard_train[0], train_state.TrainState)
   state_shard_by_stage = split_state_by_stage(
     num_logical_stages, num_physical_stages, in_shard_train[0]
   )
+  state_shard_by_stage = setup_state_for_dp(state_shard_by_stage)
+
   in_shard_train = (state_shard_by_stage,) + in_shard_train[1:]
   out_shard_train = (state_shard_by_stage,) + out_shard_train[1:]
 
@@ -379,13 +470,15 @@ def value_and_grad(
     num_logical_stages,
     num_physical_stages,
     num_mubatches,
-    params_by_stage,
+    state_by_stage,
     data_by_stage,
     dropout_rngs,
     print_memory_usage=False,
     schedule_name="gpipe",
 ):
-  assert num_logical_stages == len(params_by_stage) == len(data_by_stage)
+  assert num_logical_stages == len(state_by_stage) == len(data_by_stage)
+
+  params_by_stage = tuple(state.params for state in state_by_stage)
 
   tasks, fwd_input, stashed, bwd_input = setup_value_and_grad(
     num_logical_stages, num_physical_stages, num_mubatches, schedule_name,
@@ -406,7 +499,6 @@ def value_and_grad(
     )
     for stage_idx in range(num_logical_stages)
   ]
-
   # params_by_stage : stage_idx -> params
   params_by_stage = list(params_by_stage)
   # grads_by_stage : stage_idx -> grads
@@ -455,7 +547,15 @@ def value_and_grad(
 
   ### Microbatched forward+backward
   memory_usage_snapshot("start")
+
+  # Find the last mubatch that the first stage executes a bwd pass on.
+  last_bwd_mubatch_stage_0 = None
+  for mubatch_idx, stage_idx, is_bwd in reversed(tasks):
+    if stage_idx == 0 and is_bwd:
+      last_bwd_mubatch_stage_0 = mubatch_idx
+      break
   
+  # Main pipeline schedule.
   for mubatch_idx, stage_idx, is_bwd in tasks:
     with utils.annotate(f"TASK m{mubatch_idx} s{stage_idx} {'BWD' if is_bwd else 'FWD'}", color="blue"):
       ### Forward
@@ -491,26 +591,50 @@ def value_and_grad(
         curr_bwd_input = bwd_input[stage_idx][mubatch_idx]
         bwd_input[stage_idx][mubatch_idx] = None  # Clear reference.
 
-        params_by_stage[stage_idx], grads_by_stage[stage_idx], activation_cot = bwd_fns[stage_idx](
-            params_by_stage[stage_idx],
-            curr_stashed,
-            curr_bwd_input,
-            grads_by_stage[stage_idx],
-        )
-        if stage_idx - 1 >= 0:
-          bwd_input[stage_idx - 1][mubatch_idx] = transfer(stage_idx - 1, activation_cot)
-        del activation_cot
+        # Hardcoded to GPipe: Run BackwardLast instead of Backward for the first stage backward.
+        if stage_idx == 0 and mubatch_idx == last_bwd_mubatch_stage_0:
+          bwd_last_fn = ctx.section(
+            (mpmd.SectionKind.BackwardLast, stage_idx),
+            donate_argnums=(0,1,2,3,4)
+          )
+
+          params_by_stage[stage_idx], new_opt_state, grads_by_stage[stage_idx] = \
+            bwd_last_fn(
+              params_by_stage[stage_idx],
+              curr_stashed,
+              curr_bwd_input,
+              state_by_stage[stage_idx].opt_state,
+              grads_by_stage[stage_idx],
+            )
+          
+          state_by_stage = tuple(
+            state_by_stage[i] if i != 0 else state_by_stage[i].replace(opt_state=new_opt_state)
+            for i in range(len(state_by_stage))
+          )
+        
+        else:
+          bwd_fn_out = bwd_fns[stage_idx](
+              params_by_stage[stage_idx],
+              curr_stashed,
+              curr_bwd_input,
+              grads_by_stage[stage_idx],
+          )
+          if stage_idx != 0:
+            params_by_stage[stage_idx], grads_by_stage[stage_idx], activation_cot = bwd_fn_out
+            bwd_input[stage_idx - 1][mubatch_idx] = transfer(stage_idx - 1, activation_cot)
+            del activation_cot
+          else:
+            params_by_stage[stage_idx], grads_by_stage[stage_idx] = bwd_fn_out
+
 
   loss, aux = stack_metrics(loss, aux)
+
+  state_by_stage = tuple(
+    state.replace(params=params)
+    for state, params in zip(state_by_stage, params_by_stage)
+  )
   
-  # if not ctx.tracing_for_inference:
-  #   gathered_loss = multihost_utils.process_allgather(loss, tiled=True)
-  #   gathered_aux = multihost_utils.process_allgather(aux, tiled=True)
-    
-  #   loss = gathered_loss[-1] if gathered_loss.shape[0] > 0 else gathered_loss
-  #   aux = jax.tree.map(lambda x: x[-1] if x.shape[0] > 0 else x, gathered_aux)
-  
-  return params_by_stage, grads_by_stage, (loss, aux)
+  return state_by_stage, grads_by_stage, (loss, aux)
 
 @partial(jax.jit, static_argnums=(1, 2), donate_argnums=(0,))
 def reshape_reshard_data(data, num_mubatches, dp_factor):
@@ -564,14 +688,9 @@ def train_step(model, config, _state_mesh_shardings, _params_shardings, state_by
 
   # Note: value_and_grad donates params; the params_by_stage returned will merely be
   # fresh jax.Arrays containing the same data.
-  params_by_stage = tuple(state.params for state in state_by_stage)
-  params_by_stage, grads_by_stage, (loss, aux) = value_and_grad(
+  state_by_stage, grads_by_stage, (loss, aux) = value_and_grad(
     ctx, model.num_logical_stages, model.num_physical_stages, num_mubatches, 
-    params_by_stage, data_by_stage, dropout_rngs, schedule_name=config.mmpp_schedule,
-  )
-  state_by_stage = tuple(
-    state.replace(params=params)
-    for state, params in zip(state_by_stage, params_by_stage)
+    state_by_stage, data_by_stage, dropout_rngs, schedule_name=config.mmpp_schedule,
   )
 
   new_state_by_stage = update_state(ctx, state_by_stage, grads_by_stage)
