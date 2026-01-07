@@ -5,18 +5,16 @@ import dataclasses
 from functools import partial, lru_cache
 from typing import Any, Callable
 
-import threading
-from queue import SimpleQueue
-
 from flax import linen as nn
-from flax.linen import partitioning as nn_partitioning
 from flax.training import train_state
 
 import jax
 import jax.numpy as jnp
-from jax.experimental import multihost_utils
+import jax._src.core as core
+from jax._src.named_sharding import UNSPECIFIED
+from jax._src.linear_util import DebugInfo
 from jax.sharding import NamedSharding, PartitionSpec, Mesh
-import numpy as np
+
 import optax
 
 from MaxText.mmpp import models
@@ -72,7 +70,7 @@ def make_init_stage(num_mubatches, dp_factor, params, stage_index):
 
   param_infos = jax.tree.map(make_param_info, params)
 
-  def init_stage():
+  def init_stage(params):
     stage_mesh = mpmd.get_context().get_stage_mesh(stage_index)
 
     # Gradient accumulators
@@ -94,7 +92,10 @@ def make_init_stage(num_mubatches, dp_factor, params, stage_index):
       for mubatch_idx in range(num_mubatches)
     )
 
-    return grads, mubatch_ones, mubatch_idx_consts
+    # BF-16 casted stage params.
+    bf16_params = jax.tree.map(lambda x: x.astype(jnp.bfloat16), params)
+
+    return grads, mubatch_ones, mubatch_idx_consts, bf16_params
 
   return init_stage
 
@@ -105,6 +106,175 @@ def fwd_stage(fwd, params, input_activations, data, rng, mubatch_idx):
   return params, *res
 
 
+def remove_casts(bwd_stage, params, *args):
+    """
+    Modify bwd_stage to remove casts of params to bf16, and take in those bf16
+    values as inputs instead.
+
+    bwd_stage is assumed to have signature:
+        `params, *args -> *outs`.
+
+    The returned callable will have signature:
+        `params, *args, bf16_params -> *outs`
+    """
+
+    out_struct = jax.eval_shape(bwd_stage, params, *args)
+    out_flat, out_treedef = jax.tree_util.tree_flatten(out_struct)
+
+    closed_jaxpr = jax.make_jaxpr(bwd_stage)(params, *args)
+
+    num_param_leaves = len(jax.tree_util.tree_leaves(params))
+    fp32_param_vars = closed_jaxpr.jaxpr.invars[:num_param_leaves]
+
+    bf16_param_vars = [
+        core.Var(
+            aval=core.ShapedArray(v.aval.shape, jnp.bfloat16),
+            initial_qdd=v.initial_qdd,
+            final_qdd=v.final_qdd,
+        )
+        for v in fp32_param_vars
+    ]
+
+    def transform_jaxpr(
+        jaxpr: core.Jaxpr,
+        bf16_vars: list[core.Var],
+        fp32_vars: list[core.Var],
+    ) -> core.Jaxpr:
+        fp32_to_bf16 = dict(zip(fp32_vars, bf16_vars))
+        
+        aliases = {}
+        def maybe_get_alias(v):
+            if not isinstance(v, core.Var):
+                return v
+            return aliases.get(v, v)
+        
+        new_invars = jaxpr.invars + bf16_vars
+
+        # Mutates `aliases`.
+        def transform_eqn(eqn) -> core.JaxprEqn | None:
+            if (
+                eqn.primitive.name == "convert_element_type"
+                and eqn.invars[0] in fp32_to_bf16
+                and eqn.params.get("new_dtype") == jnp.bfloat16
+            ):
+                aliases[eqn.outvars[0]] = fp32_to_bf16[eqn.invars[0]]
+                return None
+
+            # Return early if the eqn does not have a sub-jaxpr.
+            if "jaxpr" not in eqn.params:
+                return eqn.replace(
+                    invars=[maybe_get_alias(v) for v in eqn.invars],
+                    outvars=[maybe_get_alias(v) for v in eqn.outvars],
+                )
+
+            # Recursively transform the sub-jaxpr.
+            inner_is_closed = isinstance(eqn.params["jaxpr"], core.ClosedJaxpr)
+            jaxpr_param_val = eqn.params["jaxpr"]
+            inner_raw_jaxpr = jaxpr_param_val.jaxpr if inner_is_closed else jaxpr_param_val
+
+            new_bf16_vars = []
+            new_fp32_vars = []
+            additional_eqn_invars = []
+
+            for inner_invar, eqn_invar in zip(
+                inner_raw_jaxpr.invars, eqn.invars
+            ):
+                if eqn_invar in fp32_vars:
+                    new_fp32_vars.append(inner_invar)
+                    additional_eqn_invars.append(fp32_to_bf16[eqn_invar])
+                    new_bf16_vars.append(
+                        core.Var(
+                            aval=fp32_to_bf16[eqn_invar].aval,
+                            initial_qdd=inner_invar.initial_qdd,
+                            final_qdd=inner_invar.final_qdd,
+                        )
+                    )
+
+            new_eqn_invars = [
+                maybe_get_alias(v) for v in eqn.invars
+            ] + additional_eqn_invars
+
+            new_eqn_outvars = [maybe_get_alias(v) for v in eqn.outvars]
+
+            new_eqn_params = eqn.params.copy()
+            transformed_raw_jaxpr = transform_jaxpr(
+                inner_raw_jaxpr, new_bf16_vars, new_fp32_vars
+            )
+
+            if inner_is_closed:
+                new_eqn_params["jaxpr"] = core.ClosedJaxpr(
+                    jaxpr=transformed_raw_jaxpr,
+                    consts=jaxpr_param_val.consts,
+                )
+            else:
+                new_eqn_params["jaxpr"] = transformed_raw_jaxpr
+
+            if "in_shardings" in new_eqn_params:
+                new_eqn_params["in_shardings"] = new_eqn_params["in_shardings"] + (
+                    UNSPECIFIED,
+                ) * len(additional_eqn_invars)
+
+            if "donated_invars" in new_eqn_params:
+                new_eqn_params["donated_invars"] = new_eqn_params["donated_invars"] + (
+                    False,
+                ) * len(additional_eqn_invars)
+
+            if (
+                "in_layouts" in new_eqn_params
+                and new_eqn_params["in_layouts"] is not None
+            ):
+                new_eqn_params["in_layouts"] = new_eqn_params["in_layouts"] + (
+                    None,
+                ) * len(additional_eqn_invars)
+
+            return eqn.replace(
+                invars=new_eqn_invars,
+                outvars=new_eqn_outvars,
+                params=new_eqn_params,
+            )
+
+        new_eqns = []
+        for eqn in jaxpr.eqns:
+            new_eqn = transform_eqn(eqn)
+            if new_eqn is not None:
+                new_eqns.append(new_eqn)
+
+        new_outvars = [maybe_get_alias(v) for v in jaxpr.outvars]
+
+        new_debug_info = jaxpr.debug_info
+        if jaxpr.debug_info.arg_names is not None:
+            num_new_args = len(new_invars) - len(jaxpr.invars)
+            new_arg_names = tuple(
+                new_debug_info.arg_names + ("_bf16_created",) * num_new_args
+            )
+            new_debug_info = DebugInfo(
+                traced_for=jaxpr.debug_info.traced_for,
+                func_src_info=jaxpr.debug_info.func_src_info,
+                arg_names=new_arg_names,
+                result_paths=jaxpr.debug_info.result_paths,
+            )
+
+        return core.Jaxpr(
+            constvars=jaxpr.constvars,
+            invars=new_invars,
+            outvars=new_outvars,
+            eqns=new_eqns,
+            effects=jaxpr.effects,
+            debug_info=new_debug_info,
+            is_high=jaxpr.is_high,
+        )
+
+    new_jaxpr = transform_jaxpr(closed_jaxpr.jaxpr, bf16_param_vars, fp32_param_vars)
+
+    def new_bwd_stage(*args):
+        flat_args = jax.tree_util.tree_leaves(args)
+        return jax.tree.unflatten(
+            out_treedef, core.eval_jaxpr(new_jaxpr, closed_jaxpr.consts, *flat_args)
+        )
+
+    return new_bwd_stage
+
+
 def bwd_stage(bwd, stage_idx, params, stashed, out_cot, grads_acc):
   grads, in_cot = bwd(stashed, out_cot, params)
   grads_acc = jax.tree.map(jnp.add, grads_acc, grads)
@@ -112,9 +282,8 @@ def bwd_stage(bwd, stage_idx, params, stashed, out_cot, grads_acc):
     return params, grads_acc, in_cot
   return params, grads_acc
 
-def bwd_last_stage(bwd, update, params, stashed, out_cot, opt_state, grads_acc):
-  grads, in_cot = bwd(stashed, out_cot, params)
-  grads_acc = jax.tree.map(jnp.add, grads_acc, grads)
+def bwd_last_stage(bwd, update, bf16_params, params, stashed, out_cot, opt_state, grads_acc):
+  params, grads_acc = bwd(bf16_params, params, stashed, out_cot, grads_acc)
   return update(params, opt_state, grads_acc)
 
 
@@ -150,18 +319,30 @@ def get_section_fns(model, state_by_stage) -> dict[mpmd.SectionName, Callable]:
   num_mubatches = model.config.num_pipeline_microbatches
   dp_factor = model.mesh.shape["data"]
   section_fns = {}
+
+  # We do this to avoid problems with late-binding with Python closures.
+  def make_fwd_step(fwd_fn):
+    return lambda bf16_params, *args: \
+      remove_casts(partial(fwd_stage, fwd_fn), *args)(*args, bf16_params)
+
+  def make_bwd_step(bwd_fn, idx):
+    return lambda bf16_params, *args: \
+      remove_casts(partial(bwd_stage, bwd_fn, idx), *args)(*args, bf16_params)
+
   for stage_index, state in enumerate(state_by_stage):
     init_stage = make_init_stage(num_mubatches, dp_factor, state.params, stage_index)
     fwd, bwd = model_fwd_and_bwd(model, stage_index)
     update_stage = make_update_stage(state.tx, stage_index, state)
     section_fns[(mpmd.SectionKind.Prologue, stage_index)] = init_stage
-    section_fns[(mpmd.SectionKind.Forward, stage_index)] = partial(fwd_stage, fwd)
-    section_fns[(mpmd.SectionKind.Backward, stage_index)] = partial(bwd_stage, bwd, stage_index)
+    section_fns[(mpmd.SectionKind.Forward, stage_index)] = make_fwd_step(fwd)
+    section_fns[(mpmd.SectionKind.Backward, stage_index)] = make_bwd_step(bwd, stage_index)
     
     if stage_index != 0:
       section_fns[(mpmd.SectionKind.Epilogue, stage_index)] = update_stage
     else:
-      section_fns[(mpmd.SectionKind.BackwardLast, stage_index)] = partial(bwd_last_stage, bwd, update_stage)
+      # params, stashed, out_cot, grads_acc
+      section_fns[(mpmd.SectionKind.BackwardLast, stage_index)] = \
+        partial(bwd_last_stage, make_bwd_step(bwd, 0), update_stage)
   return section_fns
 
 
@@ -258,6 +439,8 @@ def split_opt_state_by_stage(num_stages, opt_state):
   nu_by_stage = split_params_by_stage(num_stages, opt_state[0].nu)
 
   def clone_scalars(leaf):
+    if isinstance(leaf, (int, float)) and not isinstance(leaf, jax.Array):
+      return jnp.array(leaf)
     if hasattr(leaf, 'shape') and leaf.shape == () and leaf.dtype == jnp.int32:
       return leaf.copy() 
     return leaf
@@ -458,7 +641,9 @@ def setup_value_and_grad(
 
 @partial(jax.jit, donate_argnums=(0, 1))
 def stack_metrics(loss, aux):
-  _stack_mean = lambda x: jnp.mean(jnp.stack(x), axis=(0, 1))
+  def _stack_mean(x):
+    return jnp.mean(jnp.stack(x), axis=(0, 1))
+
   loss = _stack_mean(loss)
   aux = jax.tree.map(lambda *xs: _stack_mean(xs), *aux)
   return loss, aux
@@ -488,19 +673,20 @@ def value_and_grad(
   fwd_fns = [
     ctx.section(
           (mpmd.SectionKind.Forward, stage_idx),
-          donate_argnums=(0,1,),
+          donate_argnums=(1,2),
     )
     for stage_idx in range(num_logical_stages)
   ]
   bwd_fns = [
     ctx.section(
           (mpmd.SectionKind.Backward, stage_idx),
-          donate_argnums=(0,1,2,3) if stage_idx != num_logical_stages - 1 else (0,1,2,),
+          donate_argnums=(1,2,3,4) if stage_idx != num_logical_stages - 1 else (1,2,3),
     )
     for stage_idx in range(num_logical_stages)
   ]
   # params_by_stage : stage_idx -> params
   params_by_stage = list(params_by_stage)
+  bf16_params_by_stage = [None] * num_logical_stages
   # grads_by_stage : stage_idx -> grads
   grads_by_stage = [None] * num_logical_stages
   # loss : mubatch_idx -> loss
@@ -519,7 +705,8 @@ def value_and_grad(
   for stage_idx in range(num_logical_stages):
     _init_stage = ctx.section((mpmd.SectionKind.Prologue, stage_idx))
     with utils.annotate(f"init{stage_idx}", color="green"):
-      grads, mubatch_const_ones, idx_consts = _init_stage()
+      grads, mubatch_const_ones, idx_consts, bf16_params_by_stage[stage_idx] = \
+        _init_stage(params_by_stage[stage_idx])
     grads_by_stage[stage_idx] = grads
     assert num_mubatches == len(mubatch_const_ones) == len(idx_consts)
     mubatch_idx_consts_by_stage[stage_idx] = idx_consts
@@ -540,7 +727,7 @@ def value_and_grad(
       "aux": aux,
     }
     jax.block_until_ready(state)
-    record = dump_memory_usage_snapshot(state)
+    record = utils.dump_memory_usage_snapshot(state)
     if name == "start":
       print("MEM,name," + ",".join(k for k in sorted(record.keys())))
     print(f"MEM,{name}," + ",".join(str(record[k]) for k in sorted(record.keys())))
@@ -564,6 +751,7 @@ def value_and_grad(
         fwd_input[stage_idx][mubatch_idx] = None  # Clear reference.
 
         res = fwd_fns[stage_idx](
+            bf16_params_by_stage[stage_idx],
             params_by_stage[stage_idx],
             curr_input,
             data_by_stage[stage_idx],
@@ -591,15 +779,17 @@ def value_and_grad(
         curr_bwd_input = bwd_input[stage_idx][mubatch_idx]
         bwd_input[stage_idx][mubatch_idx] = None  # Clear reference.
 
-        # Hardcoded to GPipe: Run BackwardLast instead of Backward for the first stage backward.
+        # Run BackwardLast instead of Backward for the first stage backward.
         if stage_idx == 0 and mubatch_idx == last_bwd_mubatch_stage_0:
           bwd_last_fn = ctx.section(
             (mpmd.SectionKind.BackwardLast, stage_idx),
-            donate_argnums=(0,1,2,3,4)
+            donate_argnums=(1,2,3,4)
           )
 
+          # _, new_opt_state, grads_by_stage[stage_idx] = \
           params_by_stage[stage_idx], new_opt_state, grads_by_stage[stage_idx] = \
             bwd_last_fn(
+              bf16_params_by_stage[stage_idx],
               params_by_stage[stage_idx],
               curr_stashed,
               curr_bwd_input,
@@ -614,6 +804,7 @@ def value_and_grad(
         
         else:
           bwd_fn_out = bwd_fns[stage_idx](
+              bf16_params_by_stage[stage_idx],
               params_by_stage[stage_idx],
               curr_stashed,
               curr_bwd_input,
@@ -625,7 +816,6 @@ def value_and_grad(
             del activation_cot
           else:
             params_by_stage[stage_idx], grads_by_stage[stage_idx] = bwd_fn_out
-
 
   loss, aux = stack_metrics(loss, aux)
 

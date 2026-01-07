@@ -1,6 +1,6 @@
 #!/usr/bin/bash
 PROFILE_CMD=""
-# PROFILE_CMD="nsys profile --output scripts/outputs/profiles/REMAT_LAST-DONT_DONATE_GRADS_ACC_LAST-mpmd-gpipe-mifc_256-num_repeats_1.nsys-rep --cpuctxsw=none --trace=cublas,cuda,cudnn,cusolver,nvtx,osrt,python-gil --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop --cuda-graph-trace=node --python-sampling=true"
+# PROFILE_CMD="nsys profile --output scripts/outputs/profiles/REMAT_LAST-STAGE_0_BWD_LAST-mpmd-gpipe-mifc_256-num_repeats_1.nsys-rep --cpuctxsw=none --trace=cublas,cuda,cudnn,cusolver,nvtx,osrt,python-gil --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop --cuda-graph-trace=node --python-sampling=true"
 
 export XLA_FLAGS="--xla_disable_hlo_passes=rematerialization"
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.90

@@ -360,18 +360,17 @@ def transform(
       check_args_mesh(section_name, stage_mesh, args)
       with stage_mesh:
         if section_name not in compiled_section_fns:
-          # Dump the IR's.
-          os.makedirs("scripts/outputs/ir_dump", exist_ok=True)
-          with open(f"scripts/outputs/ir_dump/jaxpr-{section_fn.__name__}.txt", "w") as f:
-            jaxpr = get_jaxpr(jitted_section_fn, *args)
-            f.write(jaxpr)
-          with open(f"scripts/outputs/ir_dump/stable_hlo-{section_fn.__name__}.txt", "w") as f:
-            stable_hlo = get_unoptimized_stable_hlo(jitted_section_fn, *args)
-            f.write(stable_hlo)
-          with open(f"scripts/outputs/ir_dump/optimized_hlo-{section_fn.__name__}.txt", "w") as f:
-            optimized_hlo = get_optimized_hlo(jitted_section_fn, *args)
-            f.write(optimized_hlo)
-
+        #   # Dump the IR's.
+        #   os.makedirs("scripts/outputs/ir_dump", exist_ok=True)
+        #   with open(f"scripts/outputs/ir_dump/jaxpr-{section_fn.__name__}.txt", "w") as f:
+        #     jaxpr = get_jaxpr(jitted_section_fn, *args)
+        #     f.write(jaxpr)
+        #   with open(f"scripts/outputs/ir_dump/stable_hlo-{section_fn.__name__}.txt", "w") as f:
+        #     stable_hlo = get_unoptimized_stable_hlo(jitted_section_fn, *args)
+        #     f.write(stable_hlo)
+        #   with open(f"scripts/outputs/ir_dump/optimized_hlo-{section_fn.__name__}.txt", "w") as f:
+        #     optimized_hlo = get_optimized_hlo(jitted_section_fn, *args)
+        #     f.write(optimized_hlo)
 
           compiled_section_fns[section_name] = jitted_section_fn.lower(*args).compile()
         return compiled_section_fns[section_name](*args)

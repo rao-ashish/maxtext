@@ -1,6 +1,6 @@
 #!/usr/bin/bash
 PROFILE_CMD=""
-# PROFILE_CMD="nsys profile --output scripts/outputs/profiles/mmpp-spmd-mifc_256-num_repeats_4.nsys-rep --cpuctxsw=none --trace=cublas,cuda,cudnn,cusolver,nvtx,osrt,python-gil --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop --cuda-graph-trace=node --python-sampling=true"
+# PROFILE_CMD="nsys profile --output scripts/outputs/profiles/mmpp-spmd-mifc_256-num_repeats_1.nsys-rep --cpuctxsw=none --trace=cublas,cuda,cudnn,cusolver,nvtx,osrt,python-gil --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop --cuda-graph-trace=node --python-sampling=true"
 
 export XLA_FLAGS="--xla_disable_hlo_passes=rematerialization"
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.90
@@ -9,7 +9,7 @@ export NVTE_FUSED_ATTN=1
 $PROFILE_CMD python3 -m MaxText.train MaxText/configs/base.yml \
     run_name=logdir \
     model_name=llama2-7b \
-    steps=10 \
+    steps=20 \
     per_device_batch_size=2 \
     enable_checkpointing=false \
     base_output_directory=logs \

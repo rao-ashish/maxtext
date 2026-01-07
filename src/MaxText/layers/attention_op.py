@@ -1393,7 +1393,7 @@ class AttentionOp(nnx.Module):
         attn_bias_type="no_bias",  # 'no_bias', 'pre_scale_bias' or 'post_scale_bias'
         attention_dropout=self.dropout_rate,
         dropout_rng_name="aqt",
-        dtype=self.dtype,
+        # dtype=self.dtype,
         float32_logits=self.float32_logits,
         qkv_layout=qkv_layout,
         scale_factor=1.0,
