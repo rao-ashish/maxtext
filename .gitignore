@@ -2,6 +2,7 @@
 tmp/
 logs/
 src/scripts/outputs/*
+src/scripts/analyze-memory/plots/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

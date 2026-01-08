@@ -704,6 +704,11 @@ class PipelineParallelism(BaseModel):
   """Configuration for pipeline parallelism."""
   use_mmpp: bool = Field(False, description="Whether to use experimental MPMD-style pipeline parallelism.")
   mmpp_schedule: str = Field("gpipe", description="MMPP pipeline schedule: ['gpipe', '1F1B']")
+  mmpp_print_memory_usage: bool = Field(False, description="Whether to print memory usage at each step for experimental MPMD-style pipeline parallelism.")
+  mmpp_final_layer_remat_policy: str = Field(
+    "no_remat",
+    description="Remat policy to apply to final layer (rmsnorm + lm head + loss / metrics computation) when using MMPP. One of ['no_remat', 'save_logits_only', 'full_remat']."
+  )
 
   num_layers_per_pipeline_stage: int = Field(1, description="Number of layers to place on each pipeline stage.")
   num_pipeline_repeats: int = Field(

@@ -7,6 +7,7 @@ from flax.linen.partitioning import ScanIn
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh
+from jax.ad_checkpoint import checkpoint_name
 
 from MaxText import common_types
 from MaxText import max_utils
@@ -22,6 +23,74 @@ EPS = 1e-8
 
 
 ### The flax model definition
+
+### The model loss definition outside flax, as used in mmpp
+def loss_and_aux_from_logits(config, decoder_targets, decoder_targets_segmentation, logits):
+  one_hot_targets = jax.nn.one_hot(decoder_targets, config.vocab_size)
+  xent, _ = max_utils.cross_entropy_with_logits(logits, one_hot_targets, 0.0)
+  xent = nn.with_logical_constraint(xent,
+      ("activation_embed_and_logits_batch", "activation_length"))
+  # Mask out paddings at the end of each example.
+  xent = xent * (decoder_targets_segmentation != 0)
+  total_loss = jnp.sum(xent)
+  total_weights = jnp.sum(decoder_targets_segmentation != 0)
+  loss = total_loss / (total_weights + EPS)
+  assert config.num_experts == 1
+  aux = {
+      "intermediate_outputs": None,
+      "total_loss": total_loss,
+      "total_weights": total_weights,
+      "moe_lb_loss": jnp.array(0.0),
+  }
+  return loss, aux
+
+
+class FinalLayer(nn.Module):
+  config: Config
+  mesh: Mesh
+
+  @nn.compact
+  def __call__(self, y, decoder_targets, decoder_targets_segmentation, deterministic):
+    cfg = self.config
+
+    y = models.Decoder.get_norm_layer(cfg, num_features=cfg.emb_dim)(
+        dtype=cfg.dtype,
+        weight_dtype=cfg.weight_dtype,
+        name="decoder_norm",
+        epsilon=cfg.normalization_layer_epsilon,
+        kernel_axes=("norm",),
+    )(y)
+    y = nn.Dropout(
+        rate=cfg.dropout_rate,
+        broadcast_dims=(-2,),
+        name="logits_dropout",
+    )(y, deterministic=deterministic)
+
+    y = checkpoint_name(y, name="lm_head_input")
+
+    # [batch, length, emb_dim] -> [batch, length, vocab_size]
+    logits = linears.dense_general(
+        inputs_shape=y.shape,
+        out_features_shape=cfg.vocab_size,
+        weight_dtype=cfg.weight_dtype,
+        dtype=jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype,  # for logit training stability
+        kernel_axes=("embed", "vocab"),
+        name="logits_dense",
+        matmul_precision=cfg.matmul_precision,
+    )(y)  # We do not quantize the logits matmul.
+    logits = nn.with_logical_constraint(
+        logits, ("activation_embed_and_logits_batch", "activation_length", "activation_vocab")
+    )
+    if cfg.cast_logits_to_fp32:
+      logits = logits.astype(jnp.float32)
+    
+    logits = checkpoint_name(logits, name="logits")
+
+    loss, aux = loss_and_aux_from_logits(cfg, decoder_targets, decoder_targets_segmentation, logits)
+
+    return loss, aux
+
+
 class Transformer(nn.Module):
   """Transformer, specialized for mmpp."""
 
@@ -131,43 +200,19 @@ class Transformer(nn.Module):
     y = y.astype(cfg.dtype)
 
     return y
+  
+  def get_final_layer_remat_policy(self):
+    assert self.config.mmpp_final_layer_remat_policy != "no_remat"
+    if self.config.mmpp_final_layer_remat_policy == "save_logits_only":
+      return jax.checkpoint_policies.save_only_these_names(
+        "logits",
+      )
+    if self.config.mmpp_final_layer_remat_policy == "full_remat":
+      return jax.checkpoint_policies.save_only_these_names()
+    return None
 
   @nn.compact
-  def _logits(self, y, deterministic):
-    cfg = self.config
-
-    y = models.Decoder.get_norm_layer(cfg, num_features=cfg.emb_dim)(
-        dtype=cfg.dtype,
-        weight_dtype=cfg.weight_dtype,
-        name="decoder_norm",
-        epsilon=cfg.normalization_layer_epsilon,
-        kernel_axes=("norm",),
-    )(y)
-    y = nn.Dropout(
-        rate=cfg.dropout_rate,
-        broadcast_dims=(-2,),
-        name="logits_dropout",
-    )(y, deterministic=deterministic)
-
-    # [batch, length, emb_dim] -> [batch, length, vocab_size]
-    logits = linears.dense_general(
-        inputs_shape=y.shape,
-        out_features_shape=cfg.vocab_size,
-        weight_dtype=cfg.weight_dtype,
-        dtype=jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype,  # for logit training stability
-        kernel_axes=("embed", "vocab"),
-        name="logits_dense",
-        matmul_precision=cfg.matmul_precision,
-    )(y)  # We do not quantize the logits matmul.
-    logits = nn.with_logical_constraint(
-        logits, ("activation_embed_and_logits_batch", "activation_length", "activation_vocab")
-    )
-    if cfg.cast_logits_to_fp32:
-      logits = logits.astype(jnp.float32)
-    return logits
-
-  @nn.compact
-  def _stage(self, stage_index, y, decoder_segment_ids, decoder_positions):
+  def _stage(self, stage_index, y, decoder_segment_ids, decoder_positions, decoder_targets, decoder_targets_segmentation):
     cfg = self.config
 
     # NOTE: Fixed to avoid the need for static args:
@@ -211,7 +256,17 @@ class Transformer(nn.Module):
 
     ## If last stage: logits
     if stage_index == self.num_logical_stages - 1:
-      y = self._logits(y, deterministic)
+      final_layer_module = FinalLayer
+      if cfg.mmpp_final_layer_remat_policy != "no_remat":
+        final_layer_module = nn.remat(
+          final_layer_module,
+          policy=self.get_final_layer_remat_policy(),
+          prevent_cse=True,
+        )
+      
+      loss, aux = final_layer_module(config=cfg, mesh=self.mesh, name="final_layer")(y, decoder_targets, decoder_targets_segmentation, deterministic)
+      
+      return loss, aux
     
     return y
 
@@ -250,29 +305,10 @@ class Transformer(nn.Module):
           y,
           decoder_segment_ids,
           decoder_positions,
+          decoder_input_tokens,
+          decoder_segment_ids,
       )
     return y
-
-
-### The model loss definition outside flax, as used in mmpp
-def loss_and_aux_from_logits(config, data, logits):
-  one_hot_targets = jax.nn.one_hot(data["targets"], config.vocab_size)
-  xent, _ = max_utils.cross_entropy_with_logits(logits, one_hot_targets, 0.0)
-  xent = nn.with_logical_constraint(xent,
-      ("activation_embed_and_logits_batch", "activation_length"))
-  # Mask out paddings at the end of each example.
-  xent = xent * (data["targets_segmentation"] != 0)
-  total_loss = jnp.sum(xent)
-  total_weights = jnp.sum(data["targets_segmentation"] != 0)
-  loss = total_loss / (total_weights + EPS)
-  assert config.num_experts == 1
-  aux = {
-      "intermediate_outputs": None,
-      "total_loss": total_loss,
-      "total_weights": total_weights,
-      "moe_lb_loss": jnp.array(0.0),
-  }
-  return loss, aux
 
 
 # NOTE: `forward` essentially splits the monolithic `model.apply` (enters flax once)
@@ -314,17 +350,19 @@ def forward(
   for k, v in data.items():
     data[k] = v[: cfg.micro_batch_size_to_train_on, :]
 
-  output_activations = model.apply(
+  return model.apply(
     params,
     stage_index,
     data["inputs"] if stage_index == 0 else input_activations,
     data["inputs_segmentation"],
     data["inputs_position"],
+    data["targets"] if stage_index == model.num_logical_stages - 1 else None,
+    data["targets_segmentation"] if stage_index == model.num_logical_stages - 1 else None,
     rngs=rngs,
     method=model._stage,
   )
 
-  if stage_index == model.num_logical_stages - 1:
-    return loss_and_aux_from_logits(cfg, data, output_activations)
-  else:
-    return output_activations
+  # if stage_index == model.num_logical_stages - 1:
+  #   return loss_and_aux_from_logits(cfg, data, output_activations)
+  # else:
+  #   return output_activations

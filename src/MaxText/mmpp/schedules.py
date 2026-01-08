@@ -2,9 +2,6 @@ from queue import SimpleQueue
 from functools import partial
 from collections import defaultdict
 
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-
 
 # (mubatch_idx, logical_stage_idx, is_bwd)
 Task = tuple[int, int, bool]
@@ -24,6 +21,9 @@ def plot_schedule(
     filename: str,
     num_logical_stages=None,
 ):
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    
     """Plot and save a pipeline schedule."""
     num_stages = len(schedule)
     if num_stages == 0:

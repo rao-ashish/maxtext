@@ -415,9 +415,8 @@ def split_params_by_stage(num_stages, all_params):
     _params[layers_name] = _all_params[layers_name]
     if stage_index == 0:
       _params["token_embedder"] = _all_params["token_embedder"]
-    if stage_index == num_stages - 1:
-      _params["decoder_norm"] = _all_params["decoder_norm"]
-      _params["logits_dense"] = _all_params["logits_dense"]
+    if stage_index == num_stages - 1:      
+      _params["final_layer"] = _all_params["final_layer"]
     params_by_stage.append({"params": _params})
   return tuple(params_by_stage)
 
@@ -719,6 +718,7 @@ def value_and_grad(
       return
     state = {
       "params_by_stage": params_by_stage,
+      "bf16_params_by_stage": bf16_params_by_stage,
       "fwd_input": fwd_input,
       "stashed": stashed,
       "bwd_input": bwd_input,
@@ -734,6 +734,7 @@ def value_and_grad(
 
   ### Microbatched forward+backward
   memory_usage_snapshot("start")
+  # jax.profiler.save_device_memory_profile("memory_start.prof")
 
   # Find the last mubatch that the first stage executes a bwd pass on.
   last_bwd_mubatch_stage_0 = None
@@ -762,6 +763,11 @@ def value_and_grad(
         params_by_stage[stage_idx] = res[0]
         stashed[stage_idx][mubatch_idx] = res[1]
         activation = res[2]
+
+        # num_params = len(jax.tree.leaves(params_by_stage[stage_idx]))
+        # num_stashed = len(jax.tree.leaves(stashed[stage_idx][mubatch_idx]))
+        # num_activations = len(jax.tree.leaves(activation))
+        # print(f"{(mubatch_idx, stage_idx, is_bwd)}: {num_params=} {num_stashed=} {num_activations=}")
         
         if stage_idx == num_logical_stages - 1:
           loss[mubatch_idx] = activation
@@ -816,6 +822,8 @@ def value_and_grad(
             del activation_cot
           else:
             params_by_stage[stage_idx], grads_by_stage[stage_idx] = bwd_fn_out
+    
+    memory_usage_snapshot(f"after_task(mubatch_idx={mubatch_idx}|stage_idx={stage_idx}|is_bwd={is_bwd})")
 
   loss, aux = stack_metrics(loss, aux)
 
@@ -854,7 +862,7 @@ def train_step(model, config, _state_mesh_shardings, _params_shardings, state_by
   num_mubatches = config.num_pipeline_microbatches
 
   # TODO: Investigate whether this replication and resharding is a bottleneck
-  data = reshape_reshard_data(data, num_mubatches, model.mesh.shape["data"])
+  data = reshape_reshard_data(data, num_mubatches, model.mesh.shape["data"])  
   data_by_stage = tuple(
     transfer(
       stage_index,
@@ -866,6 +874,7 @@ def train_step(model, config, _state_mesh_shardings, _params_shardings, state_by
     for stage_index in range(model.num_logical_stages)
   )
   del data
+  
 
   # TODO: Also replicate dropout_rng to all stages and donate?
   dropout_rngs = tuple(
@@ -881,6 +890,7 @@ def train_step(model, config, _state_mesh_shardings, _params_shardings, state_by
   state_by_stage, grads_by_stage, (loss, aux) = value_and_grad(
     ctx, model.num_logical_stages, model.num_physical_stages, num_mubatches, 
     state_by_stage, data_by_stage, dropout_rngs, schedule_name=config.mmpp_schedule,
+    print_memory_usage=model.config.mmpp_print_memory_usage
   )
 
   new_state_by_stage = update_state(ctx, state_by_stage, grads_by_stage)

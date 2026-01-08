@@ -102,15 +102,24 @@ def fwd_and_bwd(
 ### Various debugging utilities
 
 def dump_memory_usage_snapshot(state):
-  def jax_tree_size_bytes(tree):
+  def jax_tree_size_bytes(tree, device_id=None):
     size_bytes = 0
+    
     for leaf in jax.tree_util.tree_leaves(tree):
-      if isinstance(leaf, (jax.Array, np.ndarray)):
+      if isinstance(leaf, jax.Array) and device_id is not None:
+        for shard in leaf.global_shards:
+          if shard.device.id == device_id:
+            size_bytes += shard.data.size * shard.data.dtype.itemsize
+      elif isinstance(leaf, (jax.Array, np.ndarray)):
         size_bytes += leaf.size * leaf.dtype.itemsize
     return size_bytes
 
   def gb(size_bytes):
     return size_bytes / 1024**3
+
+  # Flatten the state.
+  is_leaf = lambda x: not isinstance(x, dict) or "params_by_stage" not in x
+  flat_state, _ = jax.tree_util.tree_flatten_with_path(state, is_leaf=is_leaf)
 
   record = {}
 
@@ -129,9 +138,13 @@ def dump_memory_usage_snapshot(state):
     record[f"device{i}_limit_gb"] = limit
     record[f"device{i}_peak_gb"] = peak
 
+    # Also record how much of the known state is on this device.
+    known_state_bytes = 0
+    for path, value in flat_state:
+      known_state_bytes += jax_tree_size_bytes(value, device_id=i)
+    record[f"device{i}_known_state_gb"] = gb(known_state_bytes)
+
   print("  by known state:")
-  is_leaf = lambda x: not isinstance(x, dict) or "params_by_stage" not in x
-  flat_state, _ = jax.tree_util.tree_flatten_with_path(state, is_leaf=is_leaf)
   total_size_bytes = 0
   for path, value in flat_state:
     size_bytes = jax_tree_size_bytes(value)

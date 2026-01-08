@@ -36,7 +36,9 @@ BASE_COMMAND = """python3 -m MaxText.train MaxText/configs/base.yml \
     remat_policy=minimal_with_context \
     gradient_clipping_threshold=0 \
     attention=cudnn_flash_te \
-    use_mmpp=true"""
+    use_mmpp=true \
+    mmpp_final_layer_remat_policy=no_remat \
+    mmpp_print_memory_usage=false"""
 
 
 # ---- Main configuration dataclass ---- #
@@ -257,68 +259,93 @@ EXPERIMENTS = [
     # ),
 ]
 
-# Single process SPMD.
-for num_repeats in [1, 2, 4]:
-    EXPERIMENTS.append(
-        ExperimentConfig(
-            name=f"spmd-num_repeats_{num_repeats}",
-            overrides={
-                "num_layers_per_pipeline_stage": 4 // num_repeats,
-                "use_mmpp": False,
-            },
-            is_multiprocess=False,
-        )
-    )
-
-# Multi-process SPMD.
-for num_processes in [4, 8]:
-    for num_repeats in [1, 2, 4]:
-        EXPERIMENTS.append(
-            ExperimentConfig(
-                name=f"spmd-num_repeats_{num_repeats}-multiprocess_{num_processes}",
-                overrides={
-                    "num_layers_per_pipeline_stage": 4 // num_repeats,
-                    "use_mmpp": False,
-                },
-                is_multiprocess=True,
-                multiprocess_kwargs={
-                    "num_processes": num_processes,
-                    "devices_per_process": 8 // num_processes,
-                },
-            )
-        )
-
-# Single process MPMD.
+# Single process MPMD mubatch sweeps.
 for schedule in ["gpipe", "1F1B"]:
-    for num_repeats in [1, 2, 4]:
-        EXPERIMENTS.append(
-            ExperimentConfig(
-                name=f"mpmd-{schedule}-num_repeats_{num_repeats}",
-                overrides={
-                    "num_layers_per_pipeline_stage": 4 // num_repeats,
-                    "use_mmpp": True,
-                    "mmpp_schedule": schedule,
-                },
-                is_multiprocess=False,
-            )
-        )
-
-# Multi-process MPMD.
-for num_processes in [4, 8]:
-    for schedule in ["gpipe", "1F1B"]:
-        for num_repeats in [1, 2, 4]:
+    for num_mubatches in [4, 8, 16]:
+        for final_layer_remat_policy in ["no_remat", "save_logits_only"]:
             EXPERIMENTS.append(
                 ExperimentConfig(
-                    name=f"mpmd-{schedule}-num_repeats_{num_repeats}-multiprocess_{num_processes}",
+                    name=f"mpmd-{schedule}-num_repeats=1-num_mubatches={num_mubatches}-final_layer_remat={final_layer_remat_policy}",
                     overrides={
-                        "num_layers_per_pipeline_stage": 4 // num_repeats,
+                        "num_layers_per_pipeline_stage": 4,
                         "use_mmpp": True,
                         "mmpp_schedule": schedule,
+                        "mmpp_print_memory_usage": True,
+                        "mmpp_final_layer_remat_policy": final_layer_remat_policy,
+                        "per_device_batch_size": 2 * (num_mubatches // 4),
+                        "num_pipeline_microbatches": num_mubatches,
+                        "run_name": f"mpmd-{schedule}-num_repeats_1-num_mubatches_{num_mubatches}",
+                        "profiler": "xplane",
+                        "steps": 20,
+                        "skip_first_n_steps_for_profiler": 10,
+                        "profiler_steps": 9,
                     },
-                    is_multiprocess=True,
-                    multiprocess_kwargs={
-                        "num_processes": num_processes,
-                        "devices_per_process": 8 // num_processes,
-                    },
+                    is_multiprocess=False,
                 )
             )
+
+# # Single process MPMD.
+# for schedule in ["gpipe", "1F1B"]:
+#     for num_repeats in [1, 2, 4]:
+#         EXPERIMENTS.append(
+#             ExperimentConfig(
+#                 name=f"mpmd-{schedule}-num_repeats_{num_repeats}",
+#                 overrides={
+#                     "num_layers_per_pipeline_stage": 4 // num_repeats,
+#                     "use_mmpp": True,
+#                     "mmpp_schedule": schedule,
+#                 },
+#                 is_multiprocess=False,
+#             )
+#         )
+
+# # Multi-process MPMD.
+# for num_processes in [4, 8]:
+#     for schedule in ["gpipe", "1F1B"]:
+#         for num_repeats in [1, 2, 4]:
+#             EXPERIMENTS.append(
+#                 ExperimentConfig(
+#                     name=f"mpmd-{schedule}-num_repeats_{num_repeats}-multiprocess_{num_processes}",
+#                     overrides={
+#                         "num_layers_per_pipeline_stage": 4 // num_repeats,
+#                         "use_mmpp": True,
+#                         "mmpp_schedule": schedule,
+#                     },
+#                     is_multiprocess=True,
+#                     multiprocess_kwargs={
+#                         "num_processes": num_processes,
+#                         "devices_per_process": 8 // num_processes,
+#                     },
+#                 )
+#             )
+
+# # Single process SPMD.
+# for num_repeats in [1, 2, 4]:
+#     EXPERIMENTS.append(
+#         ExperimentConfig(
+#             name=f"spmd-num_repeats_{num_repeats}",
+#             overrides={
+#                 "num_layers_per_pipeline_stage": 4 // num_repeats,
+#                 "use_mmpp": False,
+#             },
+#             is_multiprocess=False,
+#         )
+#     )
+
+# # Multi-process SPMD.
+# for num_processes in [4, 8]:
+#     for num_repeats in [1, 2, 4]:
+#         EXPERIMENTS.append(
+#             ExperimentConfig(
+#                 name=f"spmd-num_repeats_{num_repeats}-multiprocess_{num_processes}",
+#                 overrides={
+#                     "num_layers_per_pipeline_stage": 4 // num_repeats,
+#                     "use_mmpp": False,
+#                 },
+#                 is_multiprocess=True,
+#                 multiprocess_kwargs={
+#                     "num_processes": num_processes,
+#                     "devices_per_process": 8 // num_processes,
+#                 },
+#             )
+#         )
