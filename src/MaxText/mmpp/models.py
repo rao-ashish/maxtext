@@ -114,7 +114,7 @@ class Transformer(nn.Module):
   @property
   def num_logical_stages(self):
     cfg = self.config
-    return cfg.ici_pipeline_parallelism * cfg.num_pipeline_repeats
+    return cfg.ici_pipeline_parallelism * cfg.dcn_pipeline_parallelism * cfg.num_pipeline_repeats
   
   @property
   def num_physical_stages(self):

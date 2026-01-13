@@ -3,6 +3,7 @@ tmp/
 logs/
 src/scripts/outputs/*
 src/scripts/analyze-memory/plots/*
+scripts/outputs/ir_dump
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

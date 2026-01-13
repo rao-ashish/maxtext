@@ -285,7 +285,7 @@ def transform(
         step_fn,
         in_shardings=adjust_to_stage_mesh(stage0_mesh, step_in_shardings),
         out_shardings=adjust_to_stage_mesh(stage0_mesh, step_out_shardings),
-    ).lower(*jax.tree.map(make_shape_dtype, (state, example_batch, init_rng)))
+    ).lower(*jax.tree.map(make_shape_dtype, (state, example_batch, init_rng))) #.compile()
 
   assert all(
     section_name in in_shardings_thunk and section_name in out_shardings_thunk
@@ -303,10 +303,17 @@ def transform(
   del out_shardings_thunk
 
   if print_inferred_shardings:
+    print("==== INFERRED SHARDINGS ====")
     for section_name in ctx.section_names():
       ins = jax.tree.map(lambda x: x.spec, section_in_shardings[section_name])
       outs = jax.tree.map(lambda x: x.spec, section_out_shardings[section_name])
-      print(f"  {section_name}:\n\t{ins=}\n\t{outs=}\n")
+
+      print(f"---- Section {section_name} ----")
+      print("in_shardings:")
+      jax.tree.map_with_path(lambda path, s: print(f"\t{path}: {s}"), ins)
+      print("out_shardings:")
+      jax.tree.map_with_path(lambda path, s: print(f"\t{path}: {s}"), outs)
+      print()
 
   # Phase 2: Produce final jitted sections
   print("PHASE2")
@@ -321,7 +328,7 @@ def transform(
     in_shardings = adjust_to_stage_mesh(stage_mesh, section_in_shardings[section_name])
     out_shardings = adjust_to_stage_mesh(stage_mesh, section_out_shardings[section_name])
     section_fn.__name__ = f"section_{section_kind.name}{stage_index}"
-    
+
     # # HACK: We never enforce in_shardings, and only enforce out_shardings when
     # # we want to make sure that forward outputs have leading dimensioned sharded
     # # over the 'data' mesh axis.
@@ -348,8 +355,8 @@ def transform(
     
     jitted_section_fn = jax.jit(
         section_fn,
-        in_shardings=in_shardings,
-        out_shardings=out_shardings,
+        # in_shardings=in_shardings,
+        # out_shardings=out_shardings,
         static_argnums=static_argnums,
         donate_argnums=donate_argnums,
     )
@@ -360,17 +367,36 @@ def transform(
       check_args_mesh(section_name, stage_mesh, args)
       with stage_mesh:
         if section_name not in compiled_section_fns:
-        #   # Dump the IRs.
-          os.makedirs("scripts/outputs/ir_dump", exist_ok=True)
-          with open(f"scripts/outputs/ir_dump/jaxpr-{section_fn.__name__}.txt", "w") as f:
-            jaxpr = get_jaxpr(jitted_section_fn, *args)
-            f.write(jaxpr)
-          with open(f"scripts/outputs/ir_dump/stable_hlo-{section_fn.__name__}.txt", "w") as f:
-            stable_hlo = get_unoptimized_stable_hlo(jitted_section_fn, *args)
-            f.write(stable_hlo)
-          with open(f"scripts/outputs/ir_dump/optimized_hlo-{section_fn.__name__}.txt", "w") as f:
-            optimized_hlo = get_optimized_hlo(jitted_section_fn, *args)
-            f.write(optimized_hlo)
+          # # Dump the IRs.
+          # os.makedirs("scripts/outputs/ir_dump", exist_ok=True)
+          # with open(f"scripts/outputs/ir_dump/jaxpr-{section_fn.__name__}.txt", "w") as f:
+          #   jaxpr = get_jaxpr(jitted_section_fn, *args)
+          #   f.write(jaxpr)
+          # with open(f"scripts/outputs/ir_dump/stable_hlo-{section_fn.__name__}.txt", "w") as f:
+          #   stable_hlo = get_unoptimized_stable_hlo(jitted_section_fn, *args)
+          #   f.write(stable_hlo)
+          # with open(f"scripts/outputs/ir_dump/optimized_hlo-{section_fn.__name__}.txt", "w") as f:
+          #   optimized_hlo = get_optimized_hlo(jitted_section_fn, *args)
+          #   f.write(optimized_hlo)
+
+          # print(f"---- INSIDE APPLY_STAGE {section_name} ----")
+
+          # print("Received shardings:")
+          # jax.tree.map_with_path(
+          #   lambda path, x : print(f"\t{path} : dtype={x.dtype if hasattr(x, 'dtype') else None} shape={x.shape if hasattr(x, 'shape') else None} arg_spec={x.sharding.spec if hasattr(x, 'sharding') and isinstance(x.sharding, NamedSharding) else None}"),
+          #   args
+          # )
+
+          # def check_arr_has_sharding(x, s):
+          #   if not hasattr(x, "sharding"):
+          #     return False
+          #   return x.sharding == s
+
+          # print("Received matches expected?")
+          # jax.tree.map_with_path(
+          #   lambda path, x, s : print(f"\t{path} : {check_arr_has_sharding(x, s)} arg_spec={x.sharding.spec if hasattr(x, 'sharding') and isinstance(x.sharding, NamedSharding) else 0} expected_spec={s.spec if isinstance(s, NamedSharding) else None}"),
+          #   args, in_shardings
+          # )
 
           compiled_section_fns[section_name] = jitted_section_fn.lower(*args).compile()
         return compiled_section_fns[section_name](*args)

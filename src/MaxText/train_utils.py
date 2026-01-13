@@ -162,15 +162,15 @@ def jit_train_and_eval_step(
     )
 
     state, init_rng, p_train_step = mmpp.prepare_state_and_train_step(
-          mesh,
-          model,
-          state,
-          init_rng,
-          functional_train,
-          in_shardings,
-          out_shardings,
-          example_batch,
-      )
+        mesh,
+        model,
+        state,
+        init_rng,
+        functional_train,
+        in_shardings,
+        out_shardings,
+        example_batch,
+    )
   
   else:
     p_train_step = jit_train_step(

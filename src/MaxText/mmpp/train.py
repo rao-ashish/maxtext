@@ -14,12 +14,14 @@ import jax._src.core as core
 from jax._src.named_sharding import UNSPECIFIED
 from jax._src.linear_util import DebugInfo
 from jax.sharding import NamedSharding, PartitionSpec, Mesh
+from flax.linen import partitioning as nn_partitioning
 
 import optax
 
 from MaxText.mmpp import models
 from MaxText.mmpp import mpmd
 from MaxText.mmpp import utils
+from MaxText import max_utils
 from MaxText.mmpp.schedules import make_gpipe_schedule, make_jaxpp_1F1B_schedule
 
 
@@ -93,7 +95,14 @@ def make_init_stage(num_mubatches, dp_factor, params, stage_index):
     )
 
     # BF-16 casted stage params.
-    bf16_params = jax.tree.map(lambda x: x.astype(jnp.bfloat16), params)
+    bf16_params = jax.tree.map(
+      lambda p, pi: jax.lax.with_sharding_constraint(
+        p.astype(jnp.bfloat16),
+        mpmd.sharding_with_mesh(pi.sharding, stage_mesh)
+      ),
+      params,
+      param_infos,
+    )
 
     return grads, mubatch_ones, mubatch_idx_consts, bf16_params
 
@@ -288,10 +297,21 @@ def bwd_last_stage(bwd, update, bf16_params, params, stashed, out_cot, opt_state
 
 
 def make_update_stage(tx, stage_idx, stage_state):
+
+  # Check if any of the opt_state arrays have a single device sharding.
+  def check_single(path, x):
+    if hasattr(x, "sharding") and isinstance(x.sharding, jax.sharding.SingleDeviceSharding):
+      print(f"WARNING: element at {path} has SingleDeviceSharding {x.sharding}")
+  jax.tree.map_with_path(
+    check_single,
+    stage_state.opt_state
+  )
+
   params_specs = jax.tree.map(lambda x: x.sharding.spec, stage_state.params)
   opt_state_specs = jax.tree.map(lambda x: x.sharding.spec, stage_state.opt_state)
   grad_specs = params_specs
   io_specs = (params_specs, opt_state_specs, grad_specs)
+
 
   def update_stage(params, opt_state, grads):
     stage_mesh = mpmd.get_context().get_stage_mesh(stage_idx)
@@ -299,7 +319,6 @@ def make_update_stage(tx, stage_idx, stage_state):
     @partial(jax.shard_map,
       in_specs=io_specs,
       out_specs=io_specs,
-      axis_names={"data"},
       mesh=stage_mesh)
     def shard_mapped_update(ps, os, gs):
       # No OWG: https://github.com/google/flax/blob/240a5107c02d60c171098fbc3f2738d8b6f5ba75/flax/training/train_state.py#L108-L110
@@ -320,21 +339,51 @@ def get_section_fns(model, state_by_stage) -> dict[mpmd.SectionName, Callable]:
   dp_factor = model.mesh.shape["data"]
   section_fns = {}
 
+  def constrain_to_param_shardings(x, stage_idx):
+    stage_mesh = mpmd.get_context().get_stage_mesh(stage_idx)
+
+    return jax.lax.with_sharding_constraint(
+      x,
+      jax.tree.map(
+        lambda x: mpmd.sharding_with_mesh(x.sharding, stage_mesh),
+        state_by_stage[stage_idx].params,
+      ),
+    )
+
   # We do this to avoid problems with late-binding with Python closures.
-  def make_fwd_step(fwd_fn):
-    return lambda bf16_params, *args: \
-      remove_casts(partial(fwd_stage, fwd_fn), *args)(*args, bf16_params)
+  def make_fwd_step(fwd_fn, idx):
+
+    def fwd_step(bf16_params, *args):
+      fwd_fn_out = remove_casts(
+        partial(fwd_stage, fwd_fn), *args
+      )(*args, bf16_params)
+      return constrain_to_param_shardings(fwd_fn_out[0], idx), *fwd_fn_out[1:]
+
+    return fwd_step
+
 
   def make_bwd_step(bwd_fn, idx):
-    return lambda bf16_params, *args: \
-      remove_casts(partial(bwd_stage, bwd_fn, idx), *args)(*args, bf16_params)
+
+    def bwd_step(bf16_params, *args):
+      bwd_fn_out = remove_casts(
+        partial(bwd_stage, bwd_fn, idx), *args
+      )(*args, bf16_params)
+
+      if idx != 0:
+        stage_params, stage_grads, activation_cot = bwd_fn_out
+        return constrain_to_param_shardings(stage_params, idx), constrain_to_param_shardings(stage_grads, idx), activation_cot
+      else:
+        stage_params, stage_grads = bwd_fn_out
+        return constrain_to_param_shardings(stage_params, idx), constrain_to_param_shardings(stage_grads, idx)
+    
+    return bwd_step
 
   for stage_index, state in enumerate(state_by_stage):
     init_stage = make_init_stage(num_mubatches, dp_factor, state.params, stage_index)
     fwd, bwd = model_fwd_and_bwd(model, stage_index)
     update_stage = make_update_stage(state.tx, stage_index, state)
     section_fns[(mpmd.SectionKind.Prologue, stage_index)] = init_stage
-    section_fns[(mpmd.SectionKind.Forward, stage_index)] = make_fwd_step(fwd)
+    section_fns[(mpmd.SectionKind.Forward, stage_index)] = make_fwd_step(fwd, stage_index)
     section_fns[(mpmd.SectionKind.Backward, stage_index)] = make_bwd_step(bwd, stage_index)
     
     if stage_index != 0:
@@ -534,83 +583,106 @@ def transfer(stage_idx, xs):
   return jax.tree.map(transfer_one, xs)
 
 
-def setup_state_for_dp(state_by_stage):
-  params_by_stage = tuple(s.params for s in state_by_stage)
-  opt_state_by_stage = tuple(s.opt_state for s in state_by_stage)
-
-  # @partial(jax.jit, static_argnums=1)
-  def broadcast_and_shard_array(x, stage_index):
-    x_shape = x.shape
-    x_sharding = jax.typeof(x).sharding
-
-    x = jnp.broadcast_to(jnp.expand_dims(x, 0), (x_sharding.mesh.shape["data"], *x_shape))
-    new_sharding = NamedSharding(
-      mpmd.get_context().get_stage_mesh(stage_index),
-      PartitionSpec("data", *x_sharding.spec)
-    )
-    
-    out = jax.device_put(x, new_sharding)
-
-    return out
-  
+def setup_state_for_dp(state_by_stage, mesh):
   def broadcast_and_shard(x, stage_index):
-    if isinstance(x, jax.NamedSharding):
-      return NamedSharding(x.mesh, PartitionSpec("data", *x.spec))
-    assert isinstance(x, jax.Array)
-    return broadcast_and_shard_array(x, stage_index)
+    # If x is not an array, convert to array if it is a scalar number, otherwise return.
+    if not isinstance(x, jax.Array):
+      if isinstance(x, (int, float)):
+        x = jnp.array(x)
+      else:
+        return x
 
-  new_stage_params = []
-  for stage_idx, stage_params in enumerate(params_by_stage):
-    print(f"broadcast_and_shard_array ON PARAMS {stage_idx}")
-    new_stage_params.append(
-      jax.tree.map(partial(broadcast_and_shard, stage_index=stage_idx), stage_params)
+    stage_mesh = mpmd.get_stage_mesh(mesh, stage_index)
+    data_dim = stage_mesh.shape["data"]
+    
+    # Determine specs
+    current_spec = PartitionSpec()
+    if isinstance(x.sharding, NamedSharding):
+        current_spec = x.sharding.spec
+    
+    new_spec = PartitionSpec("data", *current_spec)
+    new_sharding = NamedSharding(stage_mesh, new_spec)
+    
+    new_shape = (data_dim, *x.shape)
+    
+    x = jnp.expand_dims(x, 0)
+    x = jnp.broadcast_to(x, new_shape)
+    
+    return jax.device_put(x, new_sharding)
+
+  new_state_by_stage = []
+  for stage_idx, state in enumerate(state_by_stage):
+
+    new_state_by_stage.append(
+      jax.tree.map(partial(broadcast_and_shard, stage_index=stage_idx), state)
     )
-  params_by_stage = tuple(new_stage_params)
+    # print(f"setup_state_for_dp stage {stage_idx}")
+    # params = jax.tree.map(partial(broadcast_and_shard, stage_index=stage_idx), state.params)
+    # opt_state = jax.tree.map(partial(broadcast_and_shard, stage_index=stage_idx), state.opt_state)
+    
+    # new_state_by_stage.append(state.replace(step=jnp.array(state.step), params=params, opt_state=opt_state))
 
-  opt_mus = []
-  opt_nus = []
-  for stage_idx, opt_state in enumerate(opt_state_by_stage):
-    print(f"broadcast_and_shard_array ON OPT_STATE {stage_idx}")
-    opt_mus.append(jax.tree.map(partial(broadcast_and_shard, stage_index=stage_idx), opt_state[0].mu))
-    opt_nus.append(jax.tree.map(partial(broadcast_and_shard, stage_index=stage_idx), opt_state[0].nu))
-  
-  opt_state_by_stage = tuple(
-    utils.tuple_update(
-      opt_state, 0,
-      opt_state[0]._replace(mu=opt_mus[stage_idx], nu=opt_nus[stage_idx])
-    ) for stage_idx, opt_state in enumerate(opt_state_by_stage)
-  )
-
-  return tuple(
-    stage_state.replace(step=stage_state.step, params=params, opt_state=opt_state)
-    for stage_idx, (params, opt_state, stage_state) in enumerate(
-      zip(params_by_stage, opt_state_by_stage, state_by_stage, strict=True)
-    )
-  )
+  return tuple(new_state_by_stage)
 
 
 def split_and_transfer_state(
   mesh, num_logical_stages, num_physical_stages, state, in_shard_train, out_shard_train
 ):
-  assert mesh.shape["stage"] == num_physical_stages
-  state_by_stage = split_state_by_stage(num_logical_stages, num_physical_stages, state)
-  with mpmd.set_context(mpmd.Context(mesh, tracing_for_inference=False)):
-    state_by_stage = tuple(
-      transfer(stage_idx, state) for stage_idx, state in enumerate(state_by_stage)
-    )
-    state_by_stage = setup_state_for_dp(state_by_stage)
+  # assert mesh.shape["stage"] == num_physical_stages
+  # state_by_stage = split_state_by_stage(num_logical_stages, num_physical_stages, state)
+  # with mpmd.set_context(mpmd.Context(mesh, tracing_for_inference=False)):
+  #   state_by_stage = tuple(
+  #     transfer(stage_idx, state) for stage_idx, state in enumerate(state_by_stage)
+  #   )
+  #   state_by_stage = setup_state_for_dp(state_by_stage)
 
-  assert in_shard_train[0] == out_shard_train[0]
-  assert isinstance(in_shard_train[0], train_state.TrainState)
-  state_shard_by_stage = split_state_by_stage(
-    num_logical_stages, num_physical_stages, in_shard_train[0]
+  # assert in_shard_train[0] == out_shard_train[0]
+  # assert isinstance(in_shard_train[0], train_state.TrainState)
+  # state_shard_by_stage = split_state_by_stage(
+  #   num_logical_stages, num_physical_stages, in_shard_train[0]
+  # )
+  # state_shard_by_stage = setup_state_for_dp(state_shard_by_stage)
+
+  #   params_by_stage = split_params_by_stage(num_logical_stages, state.params)
+  # opt_state_by_stage = split_opt_state_by_stage(num_logical_stages, state.opt_state)
+  # return tuple(
+  #   jax.tree.map(
+  #     lambda x: remove_mesh_axis(x, "stage", stage_idx % num_physical_stages),
+  #     state.replace(step=state.step, params=params, opt_state=opt_state),
+  #   )
+  #   for stage_idx, (params, opt_state) in enumerate(
+  #     zip(params_by_stage, opt_state_by_stage, strict=True)
+  #   )
+  # )
+
+  state = tuple(
+    state.replace(step=state.step, params=stage_params, opt_state=stage_opt_state)
+    for stage_idx, (stage_params, stage_opt_state) in enumerate(
+      zip(state.params, state.opt_state, strict=True)
+    )
   )
-  state_shard_by_stage = setup_state_for_dp(state_shard_by_stage)
+  state_shard_by_stage = setup_state_for_dp(state, mesh)
+
+  # def _print_sharding_spec(path, leaf):
+  #   spec = "N/A"
+  #   # Check if it is a JAX array with sharding info
+  #   if hasattr(leaf, 'sharding'):
+  #     # For NamedSharding (typical with Meshes), the PartitionSpec is in .spec
+  #     if hasattr(leaf.sharding, 'spec'):
+  #       spec = leaf.sharding.spec
+  #     else:
+  #       spec = leaf.sharding
+    
+  #   print(f"{jax.tree_util.keystr(path)} : {spec}")
+
+  # print("\n=== Inspecting State Sharding Specs ===")
+  # jax.tree_util.tree_map_with_path(_print_sharding_spec, state_by_stage)
+  # print("=======================================\n")
 
   in_shard_train = (state_shard_by_stage,) + in_shard_train[1:]
   out_shard_train = (state_shard_by_stage,) + out_shard_train[1:]
 
-  return state_by_stage, in_shard_train, out_shard_train
+  return state, in_shard_train, out_shard_train
 
 
 ### Train step
@@ -679,7 +751,7 @@ def value_and_grad(
   bwd_fns = [
     ctx.section(
           (mpmd.SectionKind.Backward, stage_idx),
-          donate_argnums=(1,2,3,4) if stage_idx != num_logical_stages - 1 else (1,2,3),
+          donate_argnums=(1,2,3,4),
     )
     for stage_idx in range(num_logical_stages)
   ]
@@ -704,11 +776,9 @@ def value_and_grad(
   for stage_idx in range(num_logical_stages):
     _init_stage = ctx.section((mpmd.SectionKind.Prologue, stage_idx))
     with utils.annotate(f"init{stage_idx}", color="green"):
-      grads, mubatch_const_ones, idx_consts, bf16_params_by_stage[stage_idx] = \
+      grads_by_stage[stage_idx], mubatch_const_ones, mubatch_idx_consts_by_stage[stage_idx], bf16_params_by_stage[stage_idx] = \
         _init_stage(params_by_stage[stage_idx])
-    grads_by_stage[stage_idx] = grads
-    assert num_mubatches == len(mubatch_const_ones) == len(idx_consts)
-    mubatch_idx_consts_by_stage[stage_idx] = idx_consts
+    assert num_mubatches == len(mubatch_const_ones) == len(mubatch_idx_consts_by_stage[stage_idx])
     if stage_idx == num_logical_stages - 1:
       for mubatch_idx, const_ones in enumerate(mubatch_const_ones):
         bwd_input[stage_idx][mubatch_idx] = const_ones
@@ -719,6 +789,7 @@ def value_and_grad(
     state = {
       "params_by_stage": params_by_stage,
       "bf16_params_by_stage": bf16_params_by_stage,
+      "opt_state_by_stage": tuple(state.opt_state for state in state_by_stage),
       "fwd_input": fwd_input,
       "stashed": stashed,
       "bwd_input": bwd_input,
@@ -727,6 +798,7 @@ def value_and_grad(
       "aux": aux,
     }
     jax.block_until_ready(state)
+    # time.sleep(1)
     record = utils.dump_memory_usage_snapshot(state)
     if name == "start":
       print("MEM,name," + ",".join(k for k in sorted(record.keys())))
@@ -745,6 +817,8 @@ def value_and_grad(
   
   # Main pipeline schedule.
   for mubatch_idx, stage_idx, is_bwd in tasks:
+    print(f"ON TASK {mubatch_idx=} {stage_idx=} {is_bwd=}")
+
     with utils.annotate(f"TASK m{mubatch_idx} s{stage_idx} {'BWD' if is_bwd else 'FWD'}", color="blue"):
       ### Forward
       if not is_bwd:
@@ -764,18 +838,15 @@ def value_and_grad(
         stashed[stage_idx][mubatch_idx] = res[1]
         activation = res[2]
 
-        # num_params = len(jax.tree.leaves(params_by_stage[stage_idx]))
-        # num_stashed = len(jax.tree.leaves(stashed[stage_idx][mubatch_idx]))
-        # num_activations = len(jax.tree.leaves(activation))
-        # print(f"{(mubatch_idx, stage_idx, is_bwd)}: {num_params=} {num_stashed=} {num_activations=}")
-        
         if stage_idx == num_logical_stages - 1:
           loss[mubatch_idx] = activation
           aux[mubatch_idx] = res[3]
         else:
           fwd_input[stage_idx + 1][mubatch_idx] = transfer(stage_idx + 1, activation)
+        
         del res
         del activation
+        del curr_input
       
       ### Backward
       else:
@@ -792,9 +863,14 @@ def value_and_grad(
             donate_argnums=(1,2,3,4)
           )
 
-          # _, new_opt_state, grads_by_stage[stage_idx] = \
-          params_by_stage[stage_idx], new_opt_state, grads_by_stage[stage_idx] = \
-            bwd_last_fn(
+          # print("ABOUT TO CALL BWD LAST. STATE SHARDINGS:")
+
+          # jax.tree.map_with_path(
+          #   lambda path, x: print(f"{path}: {x.sharding if hasattr(x, "sharding") else None}"),
+          #   state_by_stage[stage_idx],
+          # )
+
+          bwd_fn_out = bwd_last_fn(
               bf16_params_by_stage[stage_idx],
               params_by_stage[stage_idx],
               curr_stashed,
@@ -803,10 +879,25 @@ def value_and_grad(
               grads_by_stage[stage_idx],
             )
           
-          state_by_stage = tuple(
+          old = params_by_stage[stage_idx]
+          params_by_stage[stage_idx] = None
+          del old
+          
+          old = grads_by_stage[stage_idx]
+          grads_by_stage[stage_idx] = None
+          del old
+          
+          params_by_stage[stage_idx], new_opt_state, grads_by_stage[stage_idx] = bwd_fn_out
+          del bwd_fn_out
+          
+          new_state_by_stage = tuple(
             state_by_stage[i] if i != 0 else state_by_stage[i].replace(opt_state=new_opt_state)
             for i in range(len(state_by_stage))
           )
+          del new_opt_state
+          del state_by_stage
+          state_by_stage = new_state_by_stage
+          del new_state_by_stage
         
         else:
           bwd_fn_out = bwd_fns[stage_idx](
@@ -816,13 +907,29 @@ def value_and_grad(
               curr_bwd_input,
               grads_by_stage[stage_idx],
           )
+          
+          old = params_by_stage[stage_idx]
+          params_by_stage[stage_idx] = None
+          del old
+          
+          old = grads_by_stage[stage_idx]
+          grads_by_stage[stage_idx] = None
+          del old
+          
           if stage_idx != 0:
             params_by_stage[stage_idx], grads_by_stage[stage_idx], activation_cot = bwd_fn_out
             bwd_input[stage_idx - 1][mubatch_idx] = transfer(stage_idx - 1, activation_cot)
             del activation_cot
           else:
             params_by_stage[stage_idx], grads_by_stage[stage_idx] = bwd_fn_out
+          
+          del bwd_fn_out
+        
+        del curr_stashed
+        del curr_bwd_input
     
+    # all_locals = locals()
+    # print(list(all_locals.keys()))
     memory_usage_snapshot(f"after_task(mubatch_idx={mubatch_idx}|stage_idx={stage_idx}|is_bwd={is_bwd})")
 
   loss, aux = stack_metrics(loss, aux)
@@ -867,14 +974,14 @@ def train_step(model, config, _state_mesh_shardings, _params_shardings, state_by
     transfer(
       stage_index,
       jax.tree.map(
-        lambda x: remove_mesh_axis(x, "stage", stage_index % model.num_physical_stages, ctx=ctx), 
+        lambda x: remove_mesh_axis(
+          x, "stage", stage_index % model.num_physical_stages, ctx=mpmd.get_context()
+        ),
         data,
       ),
     )  # replicate, it's (relatively) cheap and might overlap?
     for stage_index in range(model.num_logical_stages)
   )
-  del data
-  
 
   # TODO: Also replicate dropout_rng to all stages and donate?
   dropout_rngs = tuple(
@@ -907,6 +1014,150 @@ def train_step(model, config, _state_mesh_shardings, _params_shardings, state_by
   return new_state_by_stage, metrics
 
 
+def get_resident_bytes(params):
+    """
+    Computes the total bytes actually stored on addressable devices 
+    for the current process (useful for distributed/sharded settings).
+    """
+    leaves = jax.tree_util.tree_leaves(params)
+    total_bytes = 0
+    
+    for leaf in leaves:
+        # Check if it is a JAX Array (which has shards)
+        if isinstance(leaf, jax.Array):
+            # Sum the size of the data buffers on addressable devices only
+            for shard in leaf.addressable_shards:
+                total_bytes += shard.data.nbytes
+        elif hasattr(leaf, 'nbytes'):
+            # Fallback for standard numpy arrays or scalars
+            total_bytes += leaf.nbytes
+            
+    return total_bytes
+
+
+def init_state_mmpp(model, tx, config, rng_key):
+  assert isinstance(model, models.Transformer)
+
+  input_shape = (
+    config.micro_batch_size_to_train_on,
+    config.max_target_length,
+  )
+
+  activation_shape = (
+    *input_shape,
+    config.base_emb_dim,
+  )
+
+  state = [None] * model.num_logical_stages
+  stage_rng_keys = jax.random.split(rng_key, model.num_logical_stages)
+
+  for logical_idx in range(model.num_logical_stages):
+    print(f"==== INIT_STATE_MMPP, LOGICAL_IDX = {logical_idx} ====")
+    stage_mesh = mpmd.get_stage_mesh(model.mesh, logical_idx)
+    
+    # Derive shardings from logical axis rules.
+    input_logical_spec = PartitionSpec(*config.input_data_sharding_logical_axes)
+    input_sharding = nn.logical_to_mesh_sharding(
+        input_logical_spec, stage_mesh, config.logical_axis_rules
+    )
+
+    activation_logical_spec = PartitionSpec(
+        "activation_embed_and_logits_batch_outside_vmap",
+        "activation_length",
+        "activation_embed"
+    )
+    activation_sharding = nn.logical_to_mesh_sharding(
+        activation_logical_spec, stage_mesh, config.logical_axis_rules
+    )
+
+    if logical_idx == 0:
+      y_sharding = input_sharding
+      y_shape = input_shape
+      y_dtype = jnp.int32
+    else:
+      y_sharding = activation_sharding
+      y_shape = activation_shape
+      y_dtype = config.dtype
+
+    dummy_input = (
+      jnp.ones(y_shape, dtype=y_dtype, device=y_sharding),  # y
+      jnp.ones(input_shape, dtype=jnp.int32, device=input_sharding),  # decoder_segment_ids
+      jnp.ones(input_shape, dtype=jnp.int32, device=input_sharding),  # decoder_positions
+      jnp.ones(input_shape, dtype=jnp.int32, device=input_sharding),  # decoder_targets
+      jnp.ones(input_shape, dtype=jnp.int32, device=input_sharding),  # decoder_targets_segmentation
+    )
+
+    # print(f"dummy_input shardings, logical_idx = {logical_idx}")
+    # print(dummy_input[0].sharding)
+    # print(dummy_input[1].sharding)
+    # print(dummy_input[2].sharding)
+    # print(dummy_input[3].sharding)
+    # print(dummy_input[4].sharding)
+    
+    with stage_mesh:
+      init_rngs = jax.tree.map(
+        lambda x: jax.device_put(x, NamedSharding(stage_mesh, PartitionSpec())),
+        {
+          "params": stage_rng_keys[logical_idx],
+          "dropout": stage_rng_keys[logical_idx],
+          "aqt": stage_rng_keys[logical_idx],
+        }
+      )
+      
+      def init_fn(rngs, *args):
+        with mpmd.set_context(mpmd.Context(model.mesh, tracing_for_inference=False)):
+          stage_params = model.init(rngs, logical_idx, *args, method=model._stage)
+          return train_state.TrainState.create(
+            apply_fn=partial(models.forward, model=model, stage_index=logical_idx),
+            params=stage_params,
+            tx=tx
+          )
+
+      with nn_partitioning.axis_rules(config.logical_axis_rules):
+        abstract_params = jax.eval_shape(init_fn, init_rngs, *dummy_input)
+        state_logical_annotations = nn.get_partition_spec(abstract_params)
+        state_mesh_shardings = nn.logical_to_mesh_sharding(
+            state_logical_annotations, stage_mesh, config.logical_axis_rules
+        )
+
+        # print("Inside init_state_mmpp, stage_mesh is")
+        # print(stage_mesh)
+        # print()
+
+        # print("Inside init_state_mmpp, state_logical_annotations:")
+        # jax.tree.map_with_path(
+        #   lambda path, x: print(f"\t{path}: {x}"),
+        #   state_logical_annotations,
+        # )
+        # print()
+
+        # print("Inside init_state_mmpp, state_mesh_shardings:")
+        # jax.tree.map_with_path(
+        #   lambda path, s: print(f"\t{path}: {s.spec if isinstance(s, NamedSharding) else None}"),
+        #   state_mesh_shardings,
+        # )
+        # print()
+
+        state[logical_idx] = jax.jit(
+            init_fn,
+            out_shardings=state_mesh_shardings
+        )(init_rngs, *dummy_input)
+
+  state = max_utils.unbox_logicallypartioned(tuple(state))
+  state = setup_state_for_dp(state, model.mesh)
+
+  # Form state_mesh_annotations, state_mesh_shardings.
+  state_mesh_annotations = jax.tree.map(
+    lambda x: x.sharding.spec if hasattr(x, "sharding") and hasattr(x.sharding, "spec") else None,
+    state
+  )  
+  state_mesh_shardings = jax.tree.map(
+    lambda x: getattr(x, "sharding", None), state
+  )    
+
+  return state, state_mesh_annotations, state_mesh_shardings
+
+
 def prepare_state_and_train_step(
     mesh,
     model,
@@ -917,14 +1168,14 @@ def prepare_state_and_train_step(
     out_shard_train,
     example_batch,
 ):
-  state, in_shard_train, out_shard_train = split_and_transfer_state(
-      mesh,
-      model.num_logical_stages,
-      model.num_physical_stages,
-      state,
-      in_shard_train,
-      out_shard_train,
-  )
+  # state, in_shard_train, out_shard_train = split_and_transfer_state(
+  #     mesh,
+  #     model.num_logical_stages,
+  #     model.num_physical_stages,
+  #     state,
+  #     in_shard_train,
+  #     out_shard_train,
+  # )
 
   # Replicate init_rng
   init_rng = jax.device_put(init_rng, device=NamedSharding(mesh, PartitionSpec()))

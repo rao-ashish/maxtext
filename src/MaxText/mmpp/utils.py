@@ -20,7 +20,7 @@ from jax._src.api import NotNeeded
 from ctypes import cdll
 
 libcudart = cdll.LoadLibrary("libcudart.so")
-import nvtx
+# import nvtx
 
 
 DUMMY_VJP_FUN = None
@@ -115,7 +115,7 @@ def dump_memory_usage_snapshot(state):
     return size_bytes
 
   def gb(size_bytes):
-    return size_bytes / 1024**3
+    return size_bytes / 1000**3
 
   # Flatten the state.
   is_leaf = lambda x: not isinstance(x, dict) or "params_by_stage" not in x
@@ -126,6 +126,9 @@ def dump_memory_usage_snapshot(state):
   print("Memory usage:")
   print("  by device:")
   for i, device in enumerate(jax.devices()):
+    if device not in jax.local_devices():
+      continue
+
     stats = device.memory_stats()
     used = gb(stats["bytes_in_use"])
     limit = gb(stats["bytes_limit"])
@@ -159,8 +162,7 @@ def dump_memory_usage_snapshot(state):
 
 @contextlib.contextmanager
 def annotate(name, color):
-  with nvtx.annotate(name, color=color):
-    yield
+  yield
 
 
 def annotate_step(fn, start_step=4, end_step=6):
