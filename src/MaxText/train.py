@@ -398,7 +398,11 @@ def train_loop(config, recorder, state=None):
   params_shardings, state_mesh_shardings = sharding.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
 
   with mesh, nn_partitioning.axis_rules(config.logical_axis_rules):
-      example_batch = data_loader.load_next_batch()
+    example_batch = sharding.maybe_shard_with_name(
+        data_loader.load_next_batch(),
+        sharding.get_input_data_sharding(config, mesh),
+        shard_mode=config.shard_mode,
+    )
 
   _train_step = mmpp.train_step if config.use_mmpp else train_step
   state, init_rng, p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(

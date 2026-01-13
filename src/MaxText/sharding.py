@@ -324,6 +324,13 @@ def maybe_update_params_sharding_with_opt(config, state_mesh_shardings):
       - updated_state_mesh_shardings: State mesh shardings with updated params field
         (unchanged if shard_optimizer_over_data is False)
   """
+  if isinstance(state_mesh_shardings, tuple):
+    return tuple(
+      zip(
+        *tuple(maybe_update_params_sharding_with_opt(config, s) for s in state_mesh_shardings)
+      )
+    )
+
   prev_params_shardings = state_mesh_shardings.params
   if config.shard_optimizer_over_data:
     if isinstance(state_mesh_shardings.opt_state, optax.ScaleByAdamState):

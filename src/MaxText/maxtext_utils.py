@@ -35,6 +35,7 @@ import optax
 import orbax.checkpoint.experimental.emergency.checkpoint_manager as emergency_checkpoint_manager
 import orbax.checkpoint.experimental.emergency.replicator_checkpoint_manager as emergency_replicator_checkpoint_manager
 
+from MaxText import mmpp
 from MaxText import checkpointing
 from MaxText import max_logging
 from MaxText import max_utils
@@ -844,6 +845,13 @@ def setup_initial_state(
     state: the initialized train state
     state_mesh_annotations: the mesh annotations for the train state
   """
+
+  # Special initialization for MMPP case.
+  if config.use_mmpp:
+    state, state_mesh_annotations, state_mesh_shardings = \
+      mmpp.train.init_state_mmpp(model, tx, config, rng)
+    # state = max_utils.unbox_logicallypartioned(state)
+    return state, state_mesh_annotations, state_mesh_shardings, data_iterator
 
   unboxed_abstract_state, state_mesh_annotations, state_mesh_shardings = get_abstract_state(
       model, tx, config, rng, mesh, is_training
