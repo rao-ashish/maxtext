@@ -248,6 +248,15 @@ batch_split_factor: 1 # the factor by which to split the batch. Only used if use
 inhomogeneous_layer_cycle_interval: 1
 
 # pipeline parallelism
+
+# Whether to use MPMD pipeline parallelism.
+use_mpmd_pp: False
+mpmd_pp_optimize_for_compile_times: True
+mpmd_pp_schedule: gpipe
+mpmd_pp_final_layer_remat_policy: "save_logits_only"  # ['no_remat', 'save_logits_only', 'full_remat'].
+mpmd_pp_print_memory_usage: False
+mpmd_pp_section_fn_debug_info_dir: ""
+
 # The number of decoder layers is equal to the product of num_stages, num_layers_per_pipeline_stage and num_pipeline_repeats.
 # There is a tradeoff between the num_layers_per_pipeline_stage and num_pipeline_repeats: The more layers per stage the easier
 # it is to hide the pipeline communication behind the compute since there is more compute per stage, however there will be a larger bubble
@@ -405,6 +414,8 @@ logical_axis_rules: [
                       ['activation_batch', ['data', 'fsdp', 'fsdp_transpose', 'expert']],
                       ['activation_batch_no_exp', ['data', 'fsdp', 'fsdp_transpose']],
                       ['activation_embed_and_logits_batch', ['data', 'stage', 'fsdp', 'fsdp_transpose', 'expert']],
+                      # "activation_embed_and_logits_batch_inside_dp_vmap" is used for MPMD PP.
+                      ['activation_embed_and_logits_batch_inside_dp_vmap', ['fsdp', 'fsdp_transpose', 'expert']],
                       ['activation_embed_and_logits_batch_sequence', ['data', 'stage', 'fsdp', 'fsdp_transpose', 'sequence', 'context', 'expert']],
                       ['activation_heads', ['tensor', 'tensor_transpose', 'sequence','tensor_sequence','autoregressive']],
                       ['activation_kv_heads', ['tensor', 'tensor_transpose', 'sequence','tensor_sequence']],

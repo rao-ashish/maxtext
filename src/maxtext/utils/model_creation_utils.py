@@ -26,6 +26,7 @@ from MaxText import pyconfig
 from MaxText.layers import quantizations
 from MaxText.common_types import MODEL_MODE_TRAIN, ShardMode
 from MaxText.layers import models
+from MaxText import mpmd_pp
 from maxtext.utils import maxtext_utils
 from maxtext.utils import max_utils
 from orbax import checkpoint as ocp
@@ -97,6 +98,9 @@ def from_config(
 
 def get_transformer_model(config, mesh, quant, model_mode: str = MODEL_MODE_TRAIN, rngs: nnx.Rngs | None = None):
   """Returns the transformer model based on the configuration."""
+  if config.use_mpmd_pp:
+    assert model_mode == MODEL_MODE_TRAIN, "MPMD PP is only supported for training."
+    return mpmd_pp.PipelineParallelTransformer(config, mesh, quant)
   if rngs is not None:
     return models.Transformer(config, mesh, quant=quant, rngs=rngs, model_mode=model_mode)
   else:

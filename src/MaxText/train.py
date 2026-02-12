@@ -43,6 +43,8 @@ from MaxText import sharding
 from MaxText.layers.multi_token_prediction import calculate_mtp_acceptance_rate, calculate_mtp_loss
 from MaxText.common_types import ShardMode
 from MaxText.globals import EPS
+from MaxText import mpmd_pp
+
 # Placeholder: internal
 
 from MaxText.gradient_accumulation import gradient_accumulation_loss_and_grad
@@ -74,6 +76,12 @@ VertexTensorboardManager, _vertex_tb_is_stub = vertex_tensorboard_modules()
 
 def get_first_step(state):
   return int(state.step)
+
+
+def _is_metrics_logging_process(config):
+  if not config.use_mpmd_pp:
+    return True
+  return jax.process_index() == jax.process_count() - 1
 
 
 # -----------------------------------------------------------------------------
@@ -390,6 +398,50 @@ def eval_step(model, config, state, data, dropout_rng):
   return metrics
 
 
+def get_jitted_train_and_eval_step(
+    config,
+    model,
+    mesh,
+    state,
+    state_mesh_shardings,
+    data_loader,
+    eval_data_iterator,
+    params_shardings,
+):
+  """Initialize train and eval steps.
+
+  Returns:
+    p_train_step: Train step callable. If not using MPMD PP, this is a jitted
+      JAX function. If using MPMD PP, this is a regular python function.
+    p_eval_step: Eval step callable. None if using MPMD PP.
+  """
+  # Use default train_step if not using MPMD PP.
+  if not config.use_mpmd_pp:
+    p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(
+      config,
+      model,
+      mesh,
+      state,
+      state_mesh_shardings,
+      train_step,
+      eval_step,
+      eval_data_iterator,
+      params_shardings,
+    )
+    return p_train_step, p_eval_step
+
+  # Train step if using MPMD PP.
+  p_train_step = mpmd_pp.make_train_step(
+    model,
+    config,
+    state_mesh_shardings,
+    params_shardings,
+    state,
+  )
+
+  return p_train_step, None
+
+
 def train_loop(config, recorder, state=None):
   """Main Training loop."""
   (
@@ -414,34 +466,39 @@ def train_loop(config, recorder, state=None):
 
   params_shardings, state_mesh_shardings = sharding.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
 
-  p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(
-      config,
-      model,
-      mesh,
-      state,
-      state_mesh_shardings,
-      train_step,
-      eval_step,
-      eval_data_iterator,
-      params_shardings,
+  p_train_step, p_eval_step = get_jitted_train_and_eval_step(
+    config,
+    model,
+    mesh,
+    state,
+    state_mesh_shardings,
+    data_loader,
+    eval_data_iterator,
+    params_shardings,
   )
 
-  with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
-    shaped_batch = maxtext_utils.get_shaped_batch(config)
-    if config.shard_optimizer_over_data:
-      state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
-    maxtext_utils.maybe_dump_jaxpr(config, p_train_step, (state, shaped_batch, init_rng))
-    if config.compiled_trainstep_file == "":  # compile only when there is no pre-compiled file loaded
-      compiled = p_train_step.lower(state, shaped_batch, init_rng).compile()
-      compiled_stats = compiled.memory_analysis()
-      max_utils.print_compiled_memory_stats(compiled_stats)
+  # Setup state for ZeRO-1 sharding, maybe dump jaxpr, print compiled memory 
+  # stats. Only supported when we are not using MPMD PP.
+  if not config.use_mpmd_pp:
+    with jax.set_mesh(mesh), nn_partitioning.axis_rules(config.logical_axis_rules):
+      shaped_batch = maxtext_utils.get_shaped_batch(config)
+      if config.shard_optimizer_over_data:
+        state = sharding.maybe_shard_with_name(state, state_mesh_shardings, config.shard_mode)
+      maxtext_utils.maybe_dump_jaxpr(config, p_train_step, (state, shaped_batch, init_rng))
+      if config.compiled_trainstep_file == "":  # compile only when there is no pre-compiled file loaded
+        compiled = p_train_step.lower(state, shaped_batch, init_rng).compile()
+        compiled_stats = compiled.memory_analysis()
+        max_utils.print_compiled_memory_stats(compiled_stats)
 
-  start_step = get_first_step(state)  # this is the start_step for training
+  # This is the start_step for training.
+  start_step = get_first_step(state) if not config.use_mpmd_pp else 0
+  
   prof = profiler.Profiler(config, offset_step=start_step)
   metric_logger = MetricLogger(config=config, learning_rate_schedule=learning_rate_schedule)
 
   # Write train config params, num model params, and XLA flags to tensorboard
-  metric_logger.write_setup_info_to_tensorboard(state.params)
+  params_to_log = (s.params for s in state) if isinstance(state, tuple) else state.params
+  metric_logger.write_setup_info_to_tensorboard(params_to_log)
 
   try:
     last_step_completion = datetime.datetime.now()
@@ -500,7 +557,8 @@ def train_loop(config, recorder, state=None):
       if step == start_step:
         max_utils.print_mem_stats("After params initialized")
 
-      metric_logger.buffer_and_write_train_metrics(metrics, step, step_time_delta)
+      if _is_metrics_logging_process(config):
+        metric_logger.buffer_and_write_train_metrics(metrics, step, step_time_delta)
 
     if config.save_checkpoint_on_completion:
       state_to_save = state if not config.use_dpo else _split_dpo_state(state)[0]
@@ -511,7 +569,8 @@ def train_loop(config, recorder, state=None):
   except exceptions.StopTraining as e:
     max_logging.log(f"Training stopped: {str(e)}")
   finally:
-    metric_logger.flush_metrics_and_cleanup()
+    if _is_metrics_logging_process(config):
+      metric_logger.flush_metrics_and_cleanup()
 
   return state
 

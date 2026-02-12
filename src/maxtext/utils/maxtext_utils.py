@@ -37,7 +37,9 @@ import orbax.checkpoint.experimental.emergency.checkpoint_manager as emergency_c
 import orbax.checkpoint.experimental.emergency.replicator_checkpoint_manager as emergency_replicator_checkpoint_manager
 
 from MaxText import sharding
+from MaxText import mpmd_pp
 from MaxText.common_types import DecoderBlockType, MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE
+
 from maxtext.configs import types
 from maxtext.inference.page_manager import PageState
 from maxtext.common import checkpointing
@@ -1032,7 +1034,6 @@ def setup_decode_state(model, config, rng, mesh, checkpoint_manager):
 
 
 def setup_training_state(model, data_iterator, tx, config, rng, mesh, checkpoint_manager):
-  is_training = True
   return setup_initial_state(
       model,
       data_iterator,
@@ -1041,7 +1042,7 @@ def setup_training_state(model, data_iterator, tx, config, rng, mesh, checkpoint
       rng,
       mesh,
       checkpoint_manager,
-      is_training,
+      is_training=True,
   )
 
 
@@ -1071,6 +1072,13 @@ def setup_initial_state(
     state: the initialized train state
     state_mesh_annotations: the mesh annotations for the train state
   """
+
+  # Special initialization when using MPMD PP.
+  if config.use_mpmd_pp:
+    assert not config.enable_checkpointing, "MPMD PP does not support checkpointing."
+    state, state_mesh_annotations, state_mesh_shardings = \
+      mpmd_pp.init_state(model, tx, config, rng)
+    return state, state_mesh_annotations, state_mesh_shardings, data_iterator
 
   unboxed_abstract_state, state_mesh_annotations, state_mesh_shardings = get_abstract_state(
       model, tx, config, rng, mesh, is_training

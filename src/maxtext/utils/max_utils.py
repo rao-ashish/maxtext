@@ -230,8 +230,23 @@ def maybe_initialize_jax_distributed_system(raw_keys):
       "hardware"
   ] == "gpu_multiprocess":
     max_logging.log("Attempting to initialize the jax distributed system...")
+    
+    # Patch from https://github.com/AI-Hypercomputer/maxtext/pull/2945 to
+    # run on SLURM with 1 process / node.
+    devices = os.getenv("CUDA_VISIBLE_DEVICES")
+    if devices is not None:
+      try:
+        devices = [int(x) for x in devices.split(",")]
+      except Exception as e:
+        max_logging.log(f"Error parsing CUDA_VISIBLE_DEVICES: {e}")
+        devices = None
+    
     if not raw_keys["enable_emergency_checkpoint"]:
-      jax.distributed.initialize(initialization_timeout=raw_keys["jax_distributed_initialization_timeout"])
+      jax.distributed.initialize(
+        initialization_timeout=raw_keys["jax_distributed_initialization_timeout"],
+        heartbeat_timeout_seconds=6000,
+        local_device_ids=devices,
+      )
     else:
       if raw_keys["hardware"] == "gpu_multiprocess":
         max_logging.log("Initializing jax distribtued to support local checkpointing with" " GPUs...")

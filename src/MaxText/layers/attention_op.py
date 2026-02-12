@@ -67,6 +67,7 @@ from MaxText.common_types import (
     PREFILL_LENGTH,
     Q_LENGTH,
     Q_LENGTH_NO_EXP,
+    ShardMode,
 )
 from MaxText.layers import nnx_wrappers
 from MaxText.layers.initializers import variable_to_logically_partitioned
@@ -1436,6 +1437,47 @@ class AttentionOp(nnx.Module):
     dummy_value_prefill = jnp.zeros(
         (1, self.max_target_length, self.num_kv_heads, self.config.head_dim), dtype=self.dtype
     )
+
+    if self.config.shard_mode == ShardMode.EXPLICIT:
+      auto_axes = getattr(jax.sharding, "auto_axes", None)
+      if auto_axes is None:
+        raise RuntimeError(
+            "Explicit sharding with transformer_engine fused attention requires jax.sharding.auto_axes."
+        )
+
+      @auto_axes
+      def _call_te_attention(
+          dpa_layer,
+          query,
+          key,
+          value,
+          attn_mask,
+          dummy_query_prefill,
+          dummy_key_prefill,
+          dummy_value_prefill,
+          dummy_attn_mask,
+      ):
+        dpa_layer.lazy_init(
+            dummy_query_prefill,
+            dummy_key_prefill,
+            dummy_value_prefill,
+            sequence_descriptor=dummy_attn_mask,
+        )
+        return dpa_layer(query, key, value, sequence_descriptor=attn_mask)
+
+      out_spec = jax.typeof(query).sharding.spec
+      return _call_te_attention(
+          dpa_layer,
+          query,
+          key,
+          value,
+          attn_mask,
+          dummy_query_prefill,
+          dummy_key_prefill,
+          dummy_value_prefill,
+          dummy_attn_mask,
+          out_sharding=out_spec,
+      )
 
     dpa_layer.lazy_init(dummy_query_prefill, dummy_key_prefill, dummy_value_prefill, sequence_descriptor=dummy_attn_mask)
     return dpa_layer(query, key, value, sequence_descriptor=attn_mask)

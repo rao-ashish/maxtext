@@ -1,3 +1,5 @@
+src/scripts/debug/plots
+
 *__pycache__*
 tmp/
 logs/

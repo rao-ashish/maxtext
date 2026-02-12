@@ -821,6 +821,29 @@ class IciParallelism(BaseModel):
 class PipelineParallelism(BaseModel):
   """Configuration for pipeline parallelism."""
 
+  use_mpmd_pp: bool = Field(False, description="Whether to use experimental MPMD-style pipeline parallelism.")
+  mpmd_pp_optimize_for_compile_times: bool = Field(
+      False,
+      description=(
+          "When True, canonicalize middle-stage parameter naming for MPMD PP so "
+          "jitted section functions can be reused across middle stages to reduce compile time."
+      ),
+  )
+  mpmd_pp_schedule: str = Field("gpipe", description="MPMD pipeline schedule: ['gpipe', '1F1B']")
+  mpmd_pp_print_memory_usage: bool = Field(False, description="Whether to print memory usage at each step for experimental MPMD-style pipeline parallelism.")
+  mpmd_pp_section_fn_debug_info_dir: Optional[str] = Field(
+    "",
+    description=(
+        "Where to dump section function input/output pspecs and JAX/XLA IRs "
+        "when each section function is first executed. If this is an empty "
+        "string or None, debug info for each section function is not dumped."
+    ),
+  )
+  mpmd_pp_final_layer_remat_policy: str = Field(
+    "no_remat",
+    description="Remat policy to apply to final layer (rmsnorm + lm head + loss / metrics computation) when using MMPP. One of ['no_remat', 'save_logits_only', 'full_remat']."
+  )
+
   num_layers_per_pipeline_stage: int = Field(1, description="Number of layers to place on each pipeline stage.")
   num_pipeline_repeats: int = Field(
       -1,
@@ -2149,11 +2172,25 @@ class MaxTextConfig(
             f"are used with {self.num_pipeline_microbatches} microbatches"
         )
 
-      # For AOT compilation and correctness, always prioritize the 'stage' axis for sharding when pipelining.
-      for rule in self.logical_axis_rules:
-        if rule and rule[0] == "activation_embed_and_logits_batch":
-          rule[1] = ["stage", "data", "fsdp", "fsdp_transpose", "expert"]
-          break
+      if self.use_mpmd_pp:
+        # For MPMD PP we explicitly control the DP axis via vmap.
+        for rule_idx, rule in enumerate(self.logical_axis_rules):
+          if not rule:
+            continue
+          name, axes = rule
+          if "batch" in name:
+            remove_axes = ("data", "stage")
+            if name == "activation_embed_and_logits_batch":
+              remove_axes = ("stage",)
+            new_axes = [axis for axis in axes if axis not in remove_axes]
+            self.logical_axis_rules[rule_idx] = [name, new_axes]
+
+      else:
+        # For AOT compilation and correctness, always prioritize the 'stage' axis for sharding when pipelining.
+        for rule in self.logical_axis_rules:
+          if rule and rule[0] == "activation_embed_and_logits_batch":
+            rule[1] = ["stage", "data", "fsdp", "fsdp_transpose", "expert"]
+            break
 
       if "stage" in self.mesh_axes:
         stage_idx = self.mesh_axes.index("stage")
@@ -2172,7 +2209,8 @@ class MaxTextConfig(
           and "stage" in self.data_sharding[0]
       ):
         self.data_sharding[0].remove("stage")
-        self.data_sharding[0].insert(0, "stage")
+        if not self.use_mpmd_pp:
+          self.data_sharding[0].insert(0, "stage")
 
       # Add sharding for FP8 amax history when using pipeline parallelism.
       if self.quantization and self.quantization in (
