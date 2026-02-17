@@ -4,14 +4,11 @@ stderr to log files.
 Run with: `python scripts/run_experiments.py`
 """
 
-from typing import Any
-
 import os
 import sys
 import datetime
 import subprocess
 import multiprocessing
-from dataclasses import dataclass
 
 import shlex
 import textwrap
@@ -20,7 +17,7 @@ from scripts.experiment_configs import ExperimentConfig, EXPERIMENTS
 
 
 # Where to store stdout / stderr logs for each experiment.
-BASE_LOG_DIR = "scripts/outputs"
+BASE_LOG_DIR = "scripts/sweeps/outputs"
 
 # Coordinator address for distributed experiments.
 JAX_COORDINATOR_ADDRESS = "127.0.0.1:12345"
@@ -115,7 +112,6 @@ def _multiprocess_worker_fn(
                 (i + process_idx * devices_per_process)
                 for i in range(devices_per_process)
             ],
-            partition_index=0,  # Assuming single-slice, multi-host not handled here
         )
 
         print(

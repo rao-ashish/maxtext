@@ -420,10 +420,10 @@ class Pipeline(nn.Module):
     weights = gather_weights_for_stages_in(weights)
     return weights
 
-  def get_vmap_func_for_init(self):
+  def get_vmap_func_for_init(self, deterministic, model_mode):
     """This vmap func is used to initialize the weights only on init."""
 
-    def func_to_vmap(body_instance, stages_inputs, stages_segment_ids, stages_positions, deterministic, model_mode):
+    def func_to_vmap(body_instance, stages_inputs, stages_segment_ids, stages_positions):
       """nn.vmap requires either a nn.module class or a function whose first argument is a nn.module instance."""
       if isinstance(stages_inputs, tuple):
         stages_inputs = stages_inputs[0]
@@ -431,7 +431,7 @@ class Pipeline(nn.Module):
 
     vmap_func = nn.vmap(
         func_to_vmap,
-        in_axes=(0, 0, 0, None, None),
+        in_axes=(0, 0, 0),
         spmd_axis_name="stage",
         variable_axes={"params": 0, "_overwrite_with_gradient": 0},
         split_rngs={"params": self.is_initializing(), "dropout": self.config.enable_dropout},
@@ -697,15 +697,15 @@ class Pipeline(nn.Module):
     total_iterations = real_iterations + bubble_iterations
 
     if self.is_initializing():
-      vmap_func = self.get_vmap_func_for_init()
+      vmap_func = self.get_vmap_func_for_init(deterministic, model_mode)
 
       if self.config.num_pipeline_repeats > 1:
         # To shard the weights on initialization for the circular pipeline we create weights of
         # shape [num_repeat, num_stages, ...] (e.g. [num_repeat, num_stages, embed, mlp]) and shard the num_stages axis.
         # We wrap the main stage vmap with a num_repeat vmap to generate this axis only for parameter initialization.
         vmap_func = nn.vmap(
-            vmap_func,
-            in_axes=(0, segment_idx, position_idx, None, None),
+          vmap_func,
+          in_axes=(0, segment_idx, position_idx),
             variable_axes={
                 "params": 0,
                 "_overwrite_with_gradient": 0,
@@ -735,9 +735,7 @@ class Pipeline(nn.Module):
         )
       # We only need to run one set of stages to initialize the variables, instead of looping over all microbatches for
       # the full total_iterations.
-      stage_outputs = vmap_func(
-          self.layers, example_inputs, example_segmentation, example_position, deterministic, model_mode
-      )
+      stage_outputs = vmap_func(self.layers, example_inputs, example_segmentation, example_position)
       if isinstance(stage_outputs, tuple):
         stage_outputs = stage_outputs[0]
 

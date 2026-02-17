@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 # Default env vars to set before running an experiment.
 ENV = {
-    "XLA_FLAGS": "--xla_disable_hlo_passes=rematerialization --xla_gpu_autotune_level=0",
+    "XLA_FLAGS": "--xla_disable_hlo_passes=rematerialization",
     "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.90",
     "NVTE_FUSED_ATTN": "1",
     "PYTHONUNBUFFERED": "1",
@@ -301,57 +301,61 @@ EXPERIMENTS = [
 #         )
 
 # # Multi-process MPMD.
-for num_processes in [4, 8]:
-    for schedule in ["gpipe", "1F1B"]:
-        for num_repeats in [1, 2, 4]:
-            if not (num_processes == 8 and schedule == "1F1B" and num_repeats == 1):
-                continue
-
-            EXPERIMENTS.append(
-                ExperimentConfig(
-                    name=f"mpmd-{schedule}-multiprocess=8-num_repeats=1-num_mubatches=4-final_layer_remat=save_logits_only",
-                    overrides={
-                        "num_layers_per_pipeline_stage": 8 // num_repeats,
-                        "use_mmpp": True,
-                        "mmpp_schedule": schedule,
-                        "mmpp_print_memory_usage": False,
-                        "mmpp_final_layer_remat_policy": "save_logits_only",
-                    },
-                    is_multiprocess=True,
-                    multiprocess_kwargs={
-                        "num_processes": num_processes,
-                        "devices_per_process": 8 // num_processes,
-                    },
-                )
-            )
-
-# # Single process SPMD.
-# for num_repeats in [1, 2, 4]:
-#     EXPERIMENTS.append(
-#         ExperimentConfig(
-#             name=f"spmd-num_repeats_{num_repeats}",
-#             overrides={
-#                 "num_layers_per_pipeline_stage": 4 // num_repeats,
-#                 "use_mmpp": False,
-#             },
-#             is_multiprocess=False,
-#         )
-#     )
-
-# # Multi-process SPMD.
 # for num_processes in [4, 8]:
-#     for num_repeats in [1, 2, 4]:
-#         EXPERIMENTS.append(
-#             ExperimentConfig(
-#                 name=f"spmd-num_repeats_{num_repeats}-multiprocess_{num_processes}",
-#                 overrides={
-#                     "num_layers_per_pipeline_stage": 4 // num_repeats,
-#                     "use_mmpp": False,
-#                 },
-#                 is_multiprocess=True,
-#                 multiprocess_kwargs={
-#                     "num_processes": num_processes,
-#                     "devices_per_process": 8 // num_processes,
-#                 },
+#     for schedule in ["gpipe", "1F1B"]:
+#         for num_repeats in [1, 2, 4]:
+#             if not (num_processes == 8 and schedule == "1F1B" and num_repeats == 1):
+#                 continue
+
+#             EXPERIMENTS.append(
+#                 ExperimentConfig(
+#                     name=f"mpmd-{schedule}-multiprocess=8-num_repeats=1-num_mubatches=4-final_layer_remat=save_logits_only",
+#                     overrides={
+#                         "num_layers_per_pipeline_stage": 8 // num_repeats,
+#                         "use_mmpp": True,
+#                         "mmpp_schedule": schedule,
+#                         "mmpp_print_memory_usage": False,
+#                         "mmpp_final_layer_remat_policy": "save_logits_only",
+#                     },
+#                     is_multiprocess=True,
+#                     multiprocess_kwargs={
+#                         "num_processes": num_processes,
+#                         "devices_per_process": 8 // num_processes,
+#                     },
+#                 )
 #             )
-#         )
+
+# Single process SPMD.
+for num_repeats in [1, 2, 4]:
+    EXPERIMENTS.append(
+        ExperimentConfig(
+            name=f"spmd-num_repeats_{num_repeats}",
+            overrides={
+                "num_layers_per_pipeline_stage": 8 // num_repeats,
+                "use_mmpp": False,
+                "ici_data_parallelism": 2,
+                "ici_tensor_parallelism": 1,
+            },
+            is_multiprocess=False,
+        )
+    )
+
+# Multi-process SPMD.
+for num_processes in [4, 8]:
+    for num_repeats in [1, 2, 4]:
+        EXPERIMENTS.append(
+            ExperimentConfig(
+                name=f"spmd-num_repeats_{num_repeats}-multiprocess_{num_processes}",
+                overrides={
+                    "num_layers_per_pipeline_stage": 8 // num_repeats,
+                    "use_mmpp": False,
+                    "ici_data_parallelism": 2,
+                    "ici_tensor_parallelism": 1,
+                },
+                is_multiprocess=True,
+                multiprocess_kwargs={
+                    "num_processes": num_processes,
+                    "devices_per_process": 8 // num_processes,
+                },
+            )
+        )
