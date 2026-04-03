@@ -91,8 +91,8 @@ class MetricLogger:
   Logger for saving metrics to a local file, GCS and TensorBoard.
   """
 
-  def __init__(self, config, learning_rate_schedule):
-    self.writer = max_utils.initialize_summary_writer(config.tensorboard_dir, config.run_name)
+  def __init__(self, config, learning_rate_schedule, is_writer_process=None):
+    self.writer = max_utils.initialize_summary_writer(config.tensorboard_dir, config.run_name, is_writer_process)
     self.config = config
     self.metadata = {}
     self.running_gcs_metrics = [] if config.gcs_metrics else None
@@ -256,7 +256,7 @@ class MetricLogger:
 
   def write_metrics_to_tensorboard(self, metrics, step, is_training):
     """Writes metrics to TensorBoard."""
-    if jax.process_index() == 0:
+    if self.writer is not None:
       for metric_name in metrics.get("scalar", []):
         self.writer.add_scalar(metric_name, np.array(metrics["scalar"][metric_name]), step)
       for metric_name in metrics.get("scalars", []):
@@ -265,7 +265,7 @@ class MetricLogger:
     if is_training:
       full_log = step % self.config.log_period == 0
 
-      if full_log and jax.process_index() == 0:
+      if full_log and self.writer is not None:
         max_logging.log(f"To see full metrics 'tensorboard --logdir={self.config.tensorboard_dir}'")
         self.writer.flush()
 

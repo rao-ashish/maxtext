@@ -142,13 +142,19 @@ def summarize_size_from_pytree(params):
   return num_params, num_bytes, num_bytes / num_params
 
 
-def initialize_summary_writer(tensorboard_dir, run_name):
+def initialize_summary_writer(tensorboard_dir, run_name, is_writer_process=None):
   """Return a tensorboardX SummaryWriter or a no-op stub.
 
   In decoupled mode (no Google Cloud), this prefers a repo-local
   ``local_tensorboard`` directory when tensorboardX is available.
+
+  Args:
+    is_writer_process: If provided, use this to decide whether to create a real
+      writer. If None (default), falls back to ``jax.process_index() == 0``.
   """
-  if jax.process_index() != 0:
+  if is_writer_process is None:
+    is_writer_process = jax.process_index() == 0
+  if not is_writer_process:
     return None
 
   if not _TENSORBOARDX_AVAILABLE:
@@ -177,13 +183,14 @@ def initialize_summary_writer(tensorboard_dir, run_name):
 
 
 def close_summary_writer(summary_writer):
-  if jax.process_index() == 0:
+  if summary_writer is not None:
+    summary_writer.flush()
     summary_writer.close()
 
 
 def add_text_to_summary_writer(key, value, summary_writer):
   """Writes given key-value pair to tensorboard as text/summary."""
-  if jax.process_index() == 0:
+  if summary_writer is not None:
     summary_writer.add_text(key, value)
 
 

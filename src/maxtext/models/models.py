@@ -93,7 +93,7 @@ class TransformerLinenPure(nn.Module):
     # If MTP is enabled via config, set up the MTP block.
     if self.config.mtp_num_layers > 0:
       # Get the list of layer blueprints for the current model.
-      layer_types = self.decoder.get_decoder_layers()
+      layer_types = Decoder.get_decoder_layers(self.config)
       # For MTP, we use the DecoderLayer blueprint to ensure architectural consistency.
       # By convention, this is the last layer in the list.
       mtp_layer = layer_types[-1]
@@ -372,7 +372,7 @@ class Transformer(nnx.Module):
     # If MTP is enabled via config, set up the MTP block.
     if self.config.mtp_num_layers > 0:
       # Get the list of layer blueprints for the current model.
-      layer_types = self.decoder.get_decoder_layers()
+      layer_types = Decoder.get_decoder_layers(self.config)
       # For MTP, we use the DecoderLayer blueprint to ensure architectural consistency.
       # By convention, this is the last layer in the list.
       mtp_layer = layer_types[-1]

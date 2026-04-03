@@ -45,6 +45,7 @@ from maxtext.utils import gcs_utils
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
 from maxtext.utils import sharding
+from maxtext import mpmd_pp
 
 OVERWRITE_WITH_GRADIENT = "_overwrite_with_gradient"
 
@@ -1128,6 +1129,13 @@ def setup_initial_state(
     state_mesh_annotations: the mesh annotations for the train state
   """
 
+  # Special initialization when using MPMD PP.
+  if config.use_mpmd_pp:
+    assert not config.enable_checkpointing, "MPMD PP does not support checkpointing."
+    state, state_mesh_annotations, state_mesh_shardings = \
+      mpmd_pp.init_state(model, tx, config, rng)
+    return state, state_mesh_annotations, state_mesh_shardings, data_iterator
+
   unboxed_abstract_state, state_mesh_annotations, state_mesh_shardings = get_abstract_state(
       model, tx, config, rng, mesh, is_training
   )
@@ -1315,7 +1323,7 @@ def save_quantized_checkpoint_if_configured(config, params):
 
 def add_config_to_summary_writer(config, summary_writer):
   """Writes config params to tensorboard"""
-  if jax.process_index() == 0:
+  if summary_writer is not None:
     for key, value in config.get_keys().items():
       max_utils.add_text_to_summary_writer(key, str(value), summary_writer)
 
